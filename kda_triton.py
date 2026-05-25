@@ -82,8 +82,10 @@ def kda_prefill_kernel(
     q_ptr,
     k_ptr,
     v_ptr,
-    beta_ptr,
-    g_ptr,
+    a_ptr,
+    b_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
     h0_ptr,
     out_ptr,
     ht_ptr,
@@ -93,9 +95,10 @@ def kda_prefill_kernel(
     DK: tl.constexpr,
     DV: tl.constexpr,
     BT: tl.constexpr,
+    KDA_LOWER_BOUND: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
-    head = tl.program_id(1)
+    head_id = tl.program_id(1)
 
     bos = tl.load(cu_seqlens_ptr + seq_id)
     eos = tl.load(cu_seqlens_ptr + seq_id + 1)
@@ -110,24 +113,38 @@ def kda_prefill_kernel(
 
     # H maps key/state dimension to value dimension: [DV, DK].
     h_f32 = tl.load(
-        h0_ptr + seq_id * H * DV * DK + head * DV * DK + offs_v[:, None] * DK + offs_k
+        h0_ptr
+        + seq_id * H * DV * DK
+        + head_id * DV * DK
+        + offs_v[:, None] * DK
+        + offs_k
     ).to(tl.float32)
+
+    A_ = tl.exp(tl.load(A_log_ptr + head_id).to(tl.float32))
+    dt_bias = tl.load(dt_bias_ptr + head_id * DK + offs_k).to(tl.float32)
 
     for chunk_start in range(bos, eos, BT):
         token = chunk_start + offs_t
         token_mask = token < eos
         token_pair_mask = token_mask[:, None] & token_mask
 
-        k_offs = token[:, None] * H * DK + head * DK + offs_k
+        k_offs = token[:, None] * H * DK + head_id * DK + offs_k
         q = tl.load(q_ptr + k_offs, mask=token_mask[:, None], other=0.0)
         k = tl.load(k_ptr + k_offs, mask=token_mask[:, None], other=0.0)
-        g = tl.load(g_ptr + k_offs, mask=token_mask[:, None], other=0.0)
+
+        v_offs = token[:, None] * H * DV + head_id * DV + offs_v
+        v = tl.load(v_ptr + v_offs, mask=token_mask[:, None], other=0.0)
+
+        a = tl.load(a_ptr + k_offs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + token * H + head_id, mask=token_mask, other=0.0).to(
+            tl.float32
+        )
+
+        beta = tl.where(token_mask, tl.sigmoid(b), 0.0)
+        g = KDA_LOWER_BOUND * tl.sigmoid(A_ * (a + dt_bias))
+        g = tl.where(token_mask[:, None], g, 0.0)
         g_cu = tl.cumsum(g, 0)
         g_last = tl.sum(g, axis=0)
-
-        v_offs = token[:, None] * H * DV + head * DV + offs_v
-        v = tl.load(v_ptr + v_offs, mask=token_mask[:, None], other=0.0)
-        beta = tl.load(beta_ptr + token * H + head, mask=token_mask, other=0.0)
 
         # kkt
         k_left = (k * tl.exp(g_cu)).to(tl.bfloat16)
@@ -161,7 +178,11 @@ def kda_prefill_kernel(
         tl.store(out_ptr + v_offs, o, mask=token_mask[:, None])
 
     tl.store(
-        ht_ptr + seq_id * H * DV * DK + head * DV * DK + offs_v[:, None] * DK + offs_k,
+        ht_ptr
+        + seq_id * H * DV * DK
+        + head_id * DV * DK
+        + offs_v[:, None] * DK
+        + offs_k,
         h_f32,
     )
 
@@ -170,8 +191,10 @@ def kda_prefill(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    beta: Tensor,
-    g: Tensor,
+    a: Tensor,
+    b: Tensor,
+    A_log: Tensor,
+    dt_bias: Tensor,
     h0: Tensor,
     cu_seqlens: Tensor,
     *,
@@ -187,8 +210,10 @@ def kda_prefill(
         q,
         k,
         v,
-        beta,
-        g,
+        a,
+        b,
+        A_log,
+        dt_bias,
         h0,
         out,
         ht,
@@ -198,7 +223,7 @@ def kda_prefill(
         DK,
         DV,
         chunk_size,
-        num_warps=4,
+        KDA_LOWER_BOUND,
     )
     return out, ht
 
@@ -224,7 +249,7 @@ def make_inputs(
         dtype
     )
     v = randn(1, total_tokens, H, HEAD_V_DIM)
-    raw_g = randn(1, total_tokens, H, HEAD_K_DIM)
+    a = randn(1, total_tokens, H, HEAD_K_DIM)
 
     A = torch.empty(H, dtype=torch.float32).uniform_(0.0, 16.0)
     A_log = torch.log(A)
@@ -235,12 +260,12 @@ def make_inputs(
     )
     dt = torch.clamp(dt, min=1e-4)
     dt_bias = dt + torch.log(-torch.expm1(-dt))
-    beta_logits = torch.randn(1, total_tokens, H, dtype=dtype)
+    b = torch.randn(1, total_tokens, H, dtype=dtype)
     h0 = randn(batch, H, HEAD_V_DIM, HEAD_K_DIM).float()
     cu_seqlens = F.pad(torch.tensor(lens, dtype=torch.int32).cumsum(0), (1, 0)).to(
         torch.int32
     )
-    return q, k, v, h0, cu_seqlens, raw_g, A_log, dt_bias, beta_logits
+    return q, k, v, h0, cu_seqlens, a, A_log, dt_bias, b
 
 
 def compute_gate(raw_g: Tensor, A_log: Tensor, dt_bias: Tensor) -> Tensor:
@@ -279,13 +304,13 @@ def benchmark_kda_prefill() -> None:
     for (model_name, H), (lens, seq_name) in itertools.product(
         MODEL_CASES, ALL_SEQ_CASES
     ):
-        q, k, v, h0, cu_seqlens, raw_g, A_log, dt_bias, beta_logits = make_inputs(
+        q, k, v, h0, cu_seqlens, a, A_log, dt_bias, b = make_inputs(
             lens, H=H, seed=seed
         )
         seed += 1
 
-        gate = compute_gate(raw_g, A_log, dt_bias)
-        beta = beta_logits.sigmoid()
+        gate = compute_gate(a, A_log, dt_bias)
+        beta = b.sigmoid()
 
         # Each backend gets private buffers outside the timed region. Some paths
         # reuse v as output storage and update final-state buffers.
@@ -316,8 +341,10 @@ def benchmark_kda_prefill() -> None:
                 q.squeeze(0),
                 k.squeeze(0),
                 v_triton.squeeze(0),
-                beta.squeeze(0),
-                gate.squeeze(0),
+                a,
+                b,
+                A_log,
+                dt_bias,
                 h0_triton,
                 cu_seqlens,
             )
@@ -353,8 +380,8 @@ def benchmark_kda_prefill() -> None:
                 q,
                 k,
                 v_flash,
-                raw_g,
-                beta_logits,
+                a,
+                b,
                 float(HEAD_K_DIM**-0.5),
                 out,
                 A_log,
