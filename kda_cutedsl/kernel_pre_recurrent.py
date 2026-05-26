@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
+import math
 from functools import cache
 
 import cutlass
@@ -170,6 +171,7 @@ class KDAChunkPreRecurrentKernel:
         lane_id = tid % 32
 
         BT = self.BT
+        lower_bound = self.lower_bound
         head_dim = self.head_dim
         num_stages = self.num_stages
 
@@ -315,7 +317,7 @@ class KDAChunkPreRecurrentKernel:
                 u_tmem = w_tmem + BT * 4
 
                 k_addr = sK[None, None, tma_stage].iterator.toint()
-                v_addr = sK[None, None, tma_stage].iterator.toint()
+                v_addr = sV[None, None, tma_stage].iterator.toint()
                 k_desc = sdesc_template | (k_addr >> 4)
                 v_desc = sdesc_template | (v_addr >> 4)
 
@@ -455,7 +457,7 @@ class KDAChunkPreRecurrentKernel:
                 g_cu.fill(0.0)
 
                 # TODO: separate QKVa into a->QK->V
-                if warp_id == 0:
+                if warp_id_ == 0:
                     cute.arch.mbarrier_wait(tma_full_mbar + stage_id, parity)
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
@@ -476,11 +478,9 @@ class KDAChunkPreRecurrentKernel:
                         k_f32_right = cute.make_rmem_tensor_like(k_f32)
 
                         for j in cutlass.range_constexpr(4):
-                            g = self.lower_bound * sigmoid(
+                            g_cu[j] += lower_bound * sigmoid(
                                 A_ * (a_f32[j] + dt_bias_thr[j])
                             )
-                            g_cu[j] += g
-
                             decay = cute.math.exp(g_cu[j])
                             k_f32_right[j] = k_f32[j] * f32_rcp_rn(decay)
                             q_f32[j] *= decay * scale
@@ -546,9 +546,8 @@ class KDAChunkPreRecurrentKernel:
                 ##### stage 3: mask qk and kkt #####
                 # P = causal(QK)
                 # use sA to convert ldmatrix layout to normal layout
-                p_f32 = cute.where(
-                    row_indices >= col_indices, qk.load().reshape((2, 2, 2)), 0.0
-                )
+                p_f32 = qk.load().reshape((2, 2, 2))
+                p_f32 = cute.where(row_indices >= col_indices, p_f32, 0.0)
                 p_bf16 = cute.make_rmem_tensor(8, BFloat16)
                 p_bf16.store(p_f32.to(BFloat16))
                 cute.copy(stsm_atom, p_bf16, sA_ldsm)
@@ -568,8 +567,12 @@ class KDAChunkPreRecurrentKernel:
                 beta_row = beta_row.load().reshape((2, 1, 1))
 
                 # strict lower mask
-                A = kkt.load().reshape((2, 2, 2)) * beta_row
-                A = cute.where(row_indices > col_indices, A, 0.0)
+                A_f32 = kkt.load().reshape((2, 2, 2)) * beta_row
+                A_f32 = cute.where(row_indices > col_indices, A_f32, 0.0)
+                A_bf16 = cute.make_rmem_tensor(8, BFloat16)
+                A_bf16.store(A_f32.to(BFloat16))
+                cute.copy(stsm_atom, A_bf16, sA_ldsm)
+                cute.arch.sync_warp()
 
                 ##### stage 4: Newton-Schulz inverse for inv(I+A) #####
                 #   Ai_new = 2 Ai - Ai @ M @ Ai
@@ -631,10 +634,10 @@ class KDAChunkPreRecurrentKernel:
 
                 # beta scaling
                 beta_col = cute.make_rmem_tensor(4, Float32)
-                beta_col[0] = sbeta[warp_id_ * BT + (lane_id % 4)]
-                beta_col[1] = sbeta[warp_id_ * BT + (lane_id % 4) + 1]
-                beta_col[2] = sbeta[warp_id_ * BT + (lane_id % 4) + 8]
-                beta_col[3] = sbeta[warp_id_ * BT + (lane_id % 4) + 9]
+                beta_col[0] = sbeta[warp_id_ * BT + (lane_id % 4) * 2 + 0]
+                beta_col[1] = sbeta[warp_id_ * BT + (lane_id % 4) * 2 + 1]
+                beta_col[2] = sbeta[warp_id_ * BT + (lane_id % 4) * 2 + 8]
+                beta_col[3] = sbeta[warp_id_ * BT + (lane_id % 4) * 2 + 9]
                 beta_col = beta_col.load().reshape((2, 1, 2))
 
                 Aib_f32 = Ai_f32.load().reshape((2, 2, 2)) * beta_col
@@ -722,8 +725,6 @@ class KDAChunkPreRecurrentKernel:
                         coord=(global_chunk_id, 0),
                     )
                     simple_tma_copy(W_tma_atom, sW, W_dst)
-                    with cute.arch.elect_one():
-                        cute.arch.cp_async_bulk_commit_group()
 
                 for i in cutlass.range_constexpr(2):
                     # there are (BT * 4) columns. 16x256b covers 8 columns
@@ -873,6 +874,185 @@ def kkt_qk_cutedsl(
     )
 
 
+def pre_recurrent_pytorch_reference(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    BT = KDAChunkPreRecurrentKernel.BT
+    chunk_size = BT * 4
+    total_tokens, num_heads, head_dim = Q.shape
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    pad_t = sum(
+        (int(length) + chunk_size - 1) // chunk_size * chunk_size for length in lengths
+    )
+
+    Q_ref = torch.zeros(
+        pad_t, num_heads, head_dim, dtype=torch.bfloat16, device=Q.device
+    )
+    K_ref = torch.zeros_like(Q_ref)
+    U_ref = torch.zeros_like(Q_ref)
+    W_ref = torch.zeros_like(Q_ref)
+    P_ref = torch.zeros(
+        total_tokens, num_heads, BT, dtype=torch.bfloat16, device=Q.device
+    )
+
+    gate_scale = A_log.float().exp().view(1, num_heads, 1)
+    gate_bias = dt_bias.float().view(1, num_heads, head_dim)
+    beta = b.float().sigmoid()
+    eye = torch.eye(BT, dtype=torch.float32, device=Q.device)
+
+    padded_start = 0
+    for seq_id, seq_len_t in enumerate(lengths):
+        seq_len = int(seq_len_t)
+        bos = int(cu_seqlens[seq_id].item())
+        for tile_start in range(0, seq_len, BT):
+            tile_len = min(BT, seq_len - tile_start)
+            token_start = bos + tile_start
+            out_start = padded_start + tile_start
+            token_slice = slice(token_start, token_start + tile_len)
+            out_slice = slice(out_start, out_start + tile_len)
+
+            g = KDAChunkPreRecurrentKernel.lower_bound * torch.sigmoid(
+                gate_scale * (a[token_slice].float() + gate_bias)
+            )
+            g_cu = g.cumsum(dim=0)
+            decay = g_cu.exp()
+
+            q_decay = (Q[token_slice].float() * (decay * scale)).to(torch.bfloat16)
+            k_decay = (K[token_slice].float() * decay).to(torch.bfloat16)
+            k_right = (K[token_slice].float() / decay).to(torch.bfloat16)
+
+            Q_ref[out_slice] = q_decay
+            K_ref[out_slice] = k_decay
+
+            for head_id in range(num_heads):
+                q_h = q_decay[:, head_id].float()
+                k_h = k_decay[:, head_id].float()
+                kr_h = k_right[:, head_id].float()
+                v_h = V[token_slice, head_id].float()
+                beta_h = beta[token_slice, head_id]
+
+                p = torch.tril(q_h @ kr_h.T)
+                P_ref[token_slice, head_id, :tile_len] = p.to(torch.bfloat16)
+
+                kk = k_h @ kr_h.T
+                strict_l = torch.tril(kk * beta_h[:, None], diagonal=-1)
+                inv = torch.linalg.inv(eye[:tile_len, :tile_len] + strict_l)
+                aib = (inv * beta_h).to(torch.bfloat16).float()
+                U_ref[out_slice, head_id] = (aib @ v_h).to(torch.bfloat16)
+                W_ref[out_slice, head_id] = (aib @ k_h).to(torch.bfloat16)
+
+        padded_start += (seq_len + chunk_size - 1) // chunk_size * chunk_size
+
+    return Q_ref, K_ref, U_ref, W_ref, P_ref
+
+
+def check_pre_recurrent_matches_reference(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    Q_decay: torch.Tensor,
+    K_decay: torch.Tensor,
+    U: torch.Tensor,
+    W: torch.Tensor,
+    P: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+) -> bool:
+    refs = pre_recurrent_pytorch_reference(
+        Q, K, V, a, b, A_log, dt_bias, cu_seqlens, scale
+    )
+
+    BT = KDAChunkPreRecurrentKernel.BT
+    chunk_size = BT * 4
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    valid_rows = torch.zeros(Q_decay.shape[0], dtype=torch.bool, device=Q.device)
+    p_mask = torch.zeros_like(P, dtype=torch.bool)
+    padded_start = 0
+    for seq_id, seq_len_t in enumerate(lengths):
+        seq_len = int(seq_len_t)
+        bos = int(cu_seqlens[seq_id].item())
+        for tile_start in range(0, seq_len, BT):
+            tile_len = min(BT, seq_len - tile_start)
+            token_start = bos + tile_start
+            out_start = padded_start + tile_start
+            token_slice = slice(token_start, token_start + tile_len)
+            out_slice = slice(out_start, out_start + tile_len)
+            valid_rows[out_slice] = True
+            p_mask[token_slice, :, :tile_len] = True
+        padded_start += (seq_len + chunk_size - 1) // chunk_size * chunk_size
+
+    def report(
+        name: str, actual: torch.Tensor, ref: torch.Tensor, mask: torch.Tensor
+    ) -> bool:
+        actual_f = actual.float()[mask]
+        ref_f = ref.float()[mask]
+        print(f"{name}:")
+        if actual_f.numel() == 0:
+            print("  status: SKIP")
+            print("  reason: no valid elements checked")
+            return True
+
+        abs_diff = (actual_f - ref_f).abs()
+        allowed = 7e-2 + 7e-2 * ref_f.abs()
+        bad = abs_diff > allowed
+        max_abs, flat_idx = abs_diff.max(dim=0)
+        ref_abs = ref_f.abs()
+        rel_diff = abs_diff / torch.where(
+            ref_abs > 0, ref_abs, torch.ones_like(ref_abs)
+        )
+        max_rel = rel_diff.max()
+        ok = not bool(bad.any())
+        status = "PASS" if ok else "FAIL"
+        bad_count = int(bad.sum().item())
+        total = actual_f.numel()
+
+        bad_pct = 100.0 * bad_count / total
+        print(f"  status: {status}")
+        print(f"  bad: {bad_count}/{total} ({bad_pct:.2f}%)")
+        print(
+            f"  max_abs: {float(max_abs.item()):.6g}, "
+            f"max_rel: {float(max_rel.item()):.6g}"
+        )
+        print(
+            f"  absmax: actual={float(actual_f.abs().max().item()):.6g}, "
+            f"ref={float(ref_f.abs().max().item()):.6g}"
+        )
+        if not ok:
+            flat_idx_i = int(flat_idx.item())
+            checked_indices = torch.nonzero(mask, as_tuple=False)
+            original_idx = tuple(int(v) for v in checked_indices[flat_idx_i].tolist())
+            print(
+                f"  worst: idx={original_idx}, "
+                f"actual={float(actual_f[flat_idx_i].item()):.6g}, "
+                f"ref={float(ref_f[flat_idx_i].item()):.6g}, "
+                f"abs={float(abs_diff[flat_idx_i].item()):.6g}, "
+                f"rel={float(rel_diff[flat_idx_i].item()):.6g}"
+            )
+        return ok
+
+    print("pre-recurrent correctness")
+    ok = True
+    valid_rows_3d = valid_rows[:, None, None].expand_as(Q_decay)
+    ok &= report("Q_decay", Q_decay, refs[0], valid_rows_3d)
+    ok &= report("K_decay", K_decay, refs[1], valid_rows_3d)
+    ok &= report("U", U, refs[2], valid_rows_3d)
+    ok &= report("W", W, refs[3], valid_rows_3d)
+    ok &= report("P", P, refs[4], p_mask)
+    return ok
+
+
 def _parse_seqlens(raw: str, batch: int, seqlen: int) -> list[int]:
     if raw:
         values = [int(part) for part in raw.split(",") if part.strip()]
@@ -889,6 +1069,11 @@ def main() -> None:
     parser.add_argument("--seqlens", type=str, default="")
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--skip-check",
+        action="store_true",
+        help="launch without PyTorch correctness check",
+    )
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
@@ -903,13 +1088,23 @@ def main() -> None:
     total_tokens = offsets[-1]
     pad_t = ((torch.tensor(seqlens) + (BT * 4 - 1)) // (BT * 4) * (BT * 4)).sum().item()
     HEAD_DIM = 128
+    scale = float(HEAD_DIM**-0.5)
     Q = torch.randn(total_tokens, args.heads, HEAD_DIM, dtype=torch.bfloat16)
     K = torch.randn_like(Q)
+    Q = torch.nn.functional.normalize(Q.float(), p=2, dim=-1).to(torch.bfloat16)
+    K = torch.nn.functional.normalize(K.float(), p=2, dim=-1).to(torch.bfloat16)
     V = torch.randn_like(Q)
     a = torch.randn_like(Q)
     b = torch.randn(total_tokens, args.heads, dtype=torch.bfloat16)
-    A_log = torch.randn(args.heads, dtype=torch.float32)
-    dt_bias = torch.randn(args.heads, HEAD_DIM, dtype=torch.float32)
+    A = torch.empty(args.heads, dtype=torch.float32).uniform_(0.0, 16.0)
+    A_log = torch.log(A)
+    dt = torch.exp(
+        torch.rand(args.heads, HEAD_DIM, dtype=torch.float32)
+        * (math.log(0.1) - math.log(0.001))
+        + math.log(0.001)
+    )
+    dt = torch.clamp(dt, min=1e-4)
+    dt_bias = dt + torch.log(-torch.expm1(-dt))
 
     Q_decay = torch.empty(pad_t, args.heads, HEAD_DIM, dtype=torch.bfloat16)
     K_decay = torch.empty_like(Q_decay)
@@ -936,14 +1131,39 @@ def main() -> None:
         cu_seqlens,
         chunk_indices,
         total_chunks,
+        scale=scale,
     )
     torch.accelerator.synchronize()
+
+    check_passed = True
+    if not args.skip_check:
+        check_passed = check_pre_recurrent_matches_reference(
+            Q,
+            K,
+            V,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            Q_decay,
+            K_decay,
+            U,
+            W,
+            P,
+            cu_seqlens,
+            scale,
+        )
 
     print(
         "launched kernel_kkt_qk",
         f"total_tokens={total_tokens}",
         f"heads={args.heads}",
         f"chunks={chunk_indices.shape[0]}",
+        (
+            "check=skipped"
+            if args.skip_check
+            else f"check={'passed' if check_passed else 'failed'}"
+        ),
     )
 
 
