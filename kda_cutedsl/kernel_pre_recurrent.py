@@ -550,10 +550,18 @@ class KDAChunkPreRecurrentKernel:
                 # use sA to convert ldmatrix layout to normal layout
                 p_f32 = qk.load().reshape((2, 2, 2))
                 p_f32 = cute.where(row_indices >= col_indices, p_f32, 0.0)
-                p_bf16 = cute.make_rmem_tensor(8, BFloat16)
-                p_bf16.store(p_f32.to(BFloat16))
+
+                # CuteDSL doesn't generate cvt.rn.bf16x2.f32 with .to(BFloat16)
+                # hence, do it manually
+                p_packed = cute.make_rmem_tensor(4, Uint32)
+                p_packed[0] = cvt.fp32x2_to_bf16x2(p_f32[0, 0, 0], p_f32[1, 0, 0])
+                p_packed[1] = cvt.fp32x2_to_bf16x2(p_f32[0, 1, 0], p_f32[1, 1, 0])
+                p_packed[2] = cvt.fp32x2_to_bf16x2(p_f32[0, 0, 1], p_f32[1, 0, 1])
+                p_packed[3] = cvt.fp32x2_to_bf16x2(p_f32[0, 1, 1], p_f32[1, 1, 1])
+                p_bf16 = cute.recast_tensor(p_packed, BFloat16)
                 cute.copy(stsm_atom, p_bf16, sA_ldsm)
                 cute.arch.sync_warp()
+
                 t_ = bos + (chunk_id * 4 + warp_id_) * BT + (lane_id % 16)
                 if t_ < eos:
                     cute.copy(cp_16B_atom, sA_ldsm, p_bf16)  # smem->rmem
@@ -571,8 +579,13 @@ class KDAChunkPreRecurrentKernel:
                 # strict lower mask
                 A_f32 = kkt.load().reshape((2, 2, 2)) * beta_row
                 A_f32 = cute.where(row_indices > col_indices, A_f32, 0.0)
-                A_bf16 = cute.make_rmem_tensor(8, BFloat16)
-                A_bf16.store(A_f32.to(BFloat16))
+
+                A_packed = cute.make_rmem_tensor(4, Uint32)
+                A_packed[0] = cvt.fp32x2_to_bf16x2(A_f32[0, 0, 0], A_f32[1, 0, 0])
+                A_packed[1] = cvt.fp32x2_to_bf16x2(A_f32[0, 1, 0], A_f32[1, 1, 0])
+                A_packed[2] = cvt.fp32x2_to_bf16x2(A_f32[0, 0, 1], A_f32[1, 0, 1])
+                A_packed[3] = cvt.fp32x2_to_bf16x2(A_f32[0, 1, 1], A_f32[1, 1, 1])
+                A_bf16 = cute.recast_tensor(A_packed, BFloat16)
                 cute.copy(stsm_atom, A_bf16, sA_ldsm)
                 cute.arch.sync_warp()
 
