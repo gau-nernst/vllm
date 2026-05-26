@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import math
+import statistics
 from functools import cache
 
 import cutlass
@@ -11,6 +12,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import T, dsl_user_op
+from flashinfer.testing import bench_gpu_time_with_cupti
 from quack.compile_utils import make_fake_tensor
 
 from vllm.cute_utils import (
@@ -1053,32 +1055,58 @@ def check_pre_recurrent_matches_reference(
     return ok
 
 
-def _parse_seqlens(raw: str, batch: int, seqlen: int) -> list[int]:
-    if raw:
-        values = [int(part) for part in raw.split(",") if part.strip()]
-        if not values:
-            raise ValueError("--seqlens must contain at least one integer")
-        return values
-    return [seqlen] * batch
+def benchmark_pre_recurrent(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    Q_decay: torch.Tensor,
+    K_decay: torch.Tensor,
+    U: torch.Tensor,
+    W: torch.Tensor,
+    P: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_indices: torch.Tensor,
+    total_chunks: torch.Tensor,
+    scale: float,
+) -> float:
+    def launch() -> None:
+        kkt_qk_cutedsl(
+            Q,
+            K,
+            V,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            Q_decay,
+            K_decay,
+            U,
+            W,
+            P,
+            cu_seqlens,
+            chunk_indices,
+            total_chunks,
+            scale=scale,
+        )
+
+    timings = bench_gpu_time_with_cupti(launch)
+    return statistics.median(timings)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile and launch kernel_kkt_qk.")
-    parser.add_argument("--batch", type=int, default=1)
-    parser.add_argument("--seqlen", type=int, default=64)
-    parser.add_argument("--seqlens", type=str, default="")
+    parser.add_argument("--seqlens", type=int, nargs="+", default=[63, 129, 512, 2045])
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--skip-check",
-        action="store_true",
-        help="launch without PyTorch correctness check",
-    )
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
     torch.manual_seed(args.seed)
-    seqlens = _parse_seqlens(args.seqlens, args.batch, args.seqlen)
+    seqlens = args.seqlens
     offsets = [0]
     for length in seqlens:
         offsets.append(offsets[-1] + length)
@@ -1135,35 +1163,55 @@ def main() -> None:
     )
     torch.accelerator.synchronize()
 
-    check_passed = True
-    if not args.skip_check:
-        check_passed = check_pre_recurrent_matches_reference(
-            Q,
-            K,
-            V,
-            a,
-            b,
-            A_log,
-            dt_bias,
-            Q_decay,
-            K_decay,
-            U,
-            W,
-            P,
-            cu_seqlens,
-            scale,
-        )
+    check_passed = check_pre_recurrent_matches_reference(
+        Q,
+        K,
+        V,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        Q_decay,
+        K_decay,
+        U,
+        W,
+        P,
+        cu_seqlens,
+        scale,
+    )
+
+    mean_ms = benchmark_pre_recurrent(
+        Q,
+        K,
+        V,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        Q_decay,
+        K_decay,
+        U,
+        W,
+        P,
+        cu_seqlens,
+        chunk_indices,
+        total_chunks,
+        scale,
+    )
+    mean_us = mean_ms * 1e3
+    tokens_per_s = total_tokens / (mean_ms * 1e-3)
+    chunks_per_s = chunk_indices.shape[0] / (mean_ms * 1e-3)
+    print("pre-recurrent benchmark")
+    print(f"  mean: {mean_us:.3f} us")
+    print(f"  tokens/s: {tokens_per_s:.6g}")
+    print(f"  chunks/s: {chunks_per_s:.6g}")
 
     print(
         "launched kernel_kkt_qk",
         f"total_tokens={total_tokens}",
         f"heads={args.heads}",
         f"chunks={chunk_indices.shape[0]}",
-        (
-            "check=skipped"
-            if args.skip_check
-            else f"check={'passed' if check_passed else 'failed'}"
-        ),
+        f"check={'passed' if check_passed else 'failed'}",
     )
 
 
