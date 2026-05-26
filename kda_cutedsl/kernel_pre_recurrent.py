@@ -564,7 +564,7 @@ class KDAChunkPreRecurrentKernel:
                 beta_row = cute.make_rmem_tensor(2, Float32)
                 beta_row[0] = sbeta[warp_id_ * BT + (lane_id // 4)]
                 beta_row[1] = sbeta[warp_id_ * BT + (lane_id // 4) + 8]
-                beta_row = beta_row.load().reshape((2, 1, 1))
+                beta_row = beta_row.load().reshape((1, 2, 1))
 
                 # strict lower mask
                 A_f32 = kkt.load().reshape((2, 2, 2)) * beta_row
