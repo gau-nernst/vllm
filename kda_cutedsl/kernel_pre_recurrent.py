@@ -7,6 +7,7 @@ from functools import cache
 
 import cutlass
 import torch
+import torch.nn.functional as F
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32, cute
 from cutlass._mlir.dialects import llvm
@@ -106,6 +107,7 @@ class KDAChunkPreRecurrentKernel:
         chunk_indices: cute.Tensor,
         total_chunks: cute.Tensor,
         scale: Float32,
+        norm_eps: Float32,
         num_sms: Int32,
         stream: CUstream,
     ):
@@ -143,6 +145,7 @@ class KDAChunkPreRecurrentKernel:
             chunk_indices,
             total_chunks,
             scale,
+            norm_eps,
         ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
@@ -164,6 +167,7 @@ class KDAChunkPreRecurrentKernel:
         chunk_indices: cute.Tensor,
         total_chunks: cute.Tensor,
         scale: Float32,
+        norm_eps: Float32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         bid, head_id, _ = cute.arch.block_idx()
@@ -478,6 +482,20 @@ class KDAChunkPreRecurrentKernel:
                         q_f32 = cvt.bf16x2_to_fp32x2(cute.recast_tensor(Q_thr, Uint32))
                         k_f32 = cvt.bf16x2_to_fp32x2(cute.recast_tensor(K_thr, Uint32))
                         k_f32_right = cute.make_rmem_tensor_like(k_f32)
+
+                        # apply QK norm
+                        q_sq_sum = Float32(0.0)
+                        k_sq_sum = Float32(0.0)
+                        for j in cutlass.range_constexpr(4):
+                            q_sq_sum += q_f32[j] * q_f32[j]
+                            k_sq_sum += k_f32[j] * k_f32[j]
+                        q_sq_sum = cute.arch.warp_reduction_sum(q_sq_sum)
+                        k_sq_sum = cute.arch.warp_reduction_sum(k_sq_sum)
+                        q_norm = cute.math.rsqrt(q_sq_sum + norm_eps)
+                        k_norm = cute.math.rsqrt(k_sq_sum + norm_eps)
+                        for j in cutlass.range_constexpr(4):
+                            q_f32[j] *= q_norm
+                            k_f32[j] *= k_norm
 
                         for j in cutlass.range_constexpr(4):
                             g_cu[j] += lower_bound * sigmoid(
@@ -820,6 +838,7 @@ class KDAChunkPreRecurrentKernel:
             chunk_indices,
             total_chunks,
             Float32(1.0),
+            Float32(1e-6),
             Int32(148),
             stream,
             options="--enable-tvm-ffi",
@@ -860,6 +879,7 @@ def kkt_qk_cutedsl(
     scale: float | None = None,
     num_sms: int | None = None,
     num_stages: int = 2,
+    norm_eps: float = 1e-6,
 ) -> None:
     _, num_heads, head_dim = Q.shape
 
@@ -885,6 +905,7 @@ def kkt_qk_cutedsl(
         chunk_indices,
         total_chunks,
         scale,
+        norm_eps,
         num_sms,
     )
 
@@ -899,6 +920,7 @@ def pre_recurrent_pytorch_reference(
     dt_bias: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: float,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     BT = KDAChunkPreRecurrentKernel.BT
     chunk_size = BT * 4
@@ -918,6 +940,8 @@ def pre_recurrent_pytorch_reference(
         total_tokens, num_heads, BT, dtype=torch.bfloat16, device=Q.device
     )
 
+    Q_norm = F.normalize(Q.float(), p=2, dim=-1, eps=norm_eps)
+    K_norm = F.normalize(K.float(), p=2, dim=-1, eps=norm_eps)
     gate_scale = A_log.float().exp().view(1, num_heads, 1)
     gate_bias = dt_bias.float().view(1, num_heads, head_dim)
     beta = b.float().sigmoid()
@@ -940,9 +964,12 @@ def pre_recurrent_pytorch_reference(
             g_cu = g.cumsum(dim=0)
             decay = g_cu.exp()
 
-            q_decay = (Q[token_slice].float() * (decay * scale)).to(torch.bfloat16)
-            k_decay = (K[token_slice].float() * decay).to(torch.bfloat16)
-            k_right = (K[token_slice].float() / decay).to(torch.bfloat16)
+            q = Q_norm[token_slice]
+            k = K_norm[token_slice]
+
+            q_decay = (q * (decay * scale)).to(torch.bfloat16)
+            k_decay = (k * decay).to(torch.bfloat16)
+            k_right = (k / decay).to(torch.bfloat16)
 
             Q_ref[out_slice] = q_decay
             K_ref[out_slice] = k_decay
@@ -984,9 +1011,10 @@ def check_pre_recurrent_matches_reference(
     P: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: float,
+    norm_eps: float = 1e-6,
 ) -> bool:
     refs = pre_recurrent_pytorch_reference(
-        Q, K, V, a, b, A_log, dt_bias, cu_seqlens, scale
+        Q, K, V, a, b, A_log, dt_bias, cu_seqlens, scale, norm_eps
     )
 
     BT = KDAChunkPreRecurrentKernel.BT
@@ -1085,6 +1113,7 @@ def benchmark_pre_recurrent(
     chunk_indices: torch.Tensor,
     total_chunks: torch.Tensor,
     scale: float,
+    norm_eps: float = 1e-6,
 ) -> float:
     def launch() -> None:
         kkt_qk_cutedsl(
@@ -1104,6 +1133,7 @@ def benchmark_pre_recurrent(
             chunk_indices,
             total_chunks,
             scale=scale,
+            norm_eps=norm_eps,
         )
 
     timings = bench_gpu_time_with_cupti(launch)
@@ -1132,8 +1162,6 @@ def main() -> None:
     scale = float(HEAD_DIM**-0.5)
     Q = torch.randn(total_tokens, args.heads, HEAD_DIM, dtype=torch.bfloat16)
     K = torch.randn_like(Q)
-    Q = torch.nn.functional.normalize(Q.float(), p=2, dim=-1).to(torch.bfloat16)
-    K = torch.nn.functional.normalize(K.float(), p=2, dim=-1).to(torch.bfloat16)
     V = torch.randn_like(Q)
     a = torch.randn_like(Q)
     b = torch.randn(total_tokens, args.heads, dtype=torch.bfloat16)
