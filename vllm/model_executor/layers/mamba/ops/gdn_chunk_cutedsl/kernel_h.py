@@ -182,12 +182,12 @@ class Sm100ChunkHKernel:
         sV_new = allocate_tensor(smem, BFloat16, sV_new_layout)[None, 0, None, 0]
 
         s_v_scale = smem.allocate_array(Float32, BT)
-        tma_mbar = smem.allocate_array(Int64, num_stages)
+        tma_v_mbar = smem.allocate_array(Int64, num_stages)
+        tma_wk_mbar = smem.allocate_array(Int64, num_stages)
         wh_in_mbar = smem.allocate_array(Int64, num_stages)
         wh_done_mbar = smem.allocate_array(Int64, num_stages)
         vk_in_mbar = smem.allocate_array(Int64, num_stages)
         vk_done_mbar = smem.allocate_array(Int64, num_stages)
-        h0_mbar = smem.allocate_array(Int64, 1)
         taddr = smem.allocate(Int32, 4)
 
         wh_tmem = 0
@@ -198,17 +198,17 @@ class Sm100ChunkHKernel:
         if warp_id == 0:
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(num_stages):
-                    cute.arch.mbarrier_init(tma_mbar + i, 1)
+                    cute.arch.mbarrier_init(tma_v_mbar + i, 1)
+                    cute.arch.mbarrier_init(tma_wk_mbar + i, 1)
                     cute.arch.mbarrier_init(wh_in_mbar + i, 256)
                     cute.arch.mbarrier_init(wh_done_mbar + i, 1)
                     cute.arch.mbarrier_init(vk_in_mbar + i, 256)
                     cute.arch.mbarrier_init(vk_done_mbar + i, 1)
-                cute.arch.mbarrier_init(h0_mbar, 1)
                 cute.arch.mbarrier_init_fence()
         elif warp_id == 1:
             cpasync.prefetch_descriptor(H0_tma_atom)
-            cpasync.prefetch_descriptor(W_tma_atom)
             cpasync.prefetch_descriptor(V_tma_atom)
+            cpasync.prefetch_descriptor(W_tma_atom)
             cpasync.prefetch_descriptor(K_tma_atom)
             cpasync.prefetch_descriptor(HT_tma_atom)
             cpasync.prefetch_descriptor(H_tma_atom)
@@ -228,13 +228,7 @@ class Sm100ChunkHKernel:
             k_head_id = head_id // (self.Hv // self.H)
             chunk_offset = chunk_offsets[seq_id]
 
-            # load H0
-            with cute.arch.elect_one():
-                H0_size = V_dim * K_dim * self.h_dtype.width // 8
-                cute.arch.mbarrier_arrive_and_expect_tx(h0_mbar, H0_size)
-            simple_tma_copy(
-                H0_tma_atom, tmaH0[seq_id, head_id, None, None], sH0, h0_mbar
-            )
+            V_size = BT * V_dim * 2
 
             # shape: ((BT, num_BT_tiles), (64, 2))
             gW_tiles = cute.logical_divide(tmaW[None, head_id, None], (BT, None))
@@ -244,24 +238,69 @@ class Sm100ChunkHKernel:
                 (BT, None),
             )
 
-            for chunk_id in range(num_chunks):
-                mbar = tma_mbar + stage_id
+            # 1st chunk
+            if cutlass.const_expr(True):
+                chunk_id = 0
                 gW = gW_tiles[(None, chunk_offset + chunk_id), None]
                 gV = gV_tiles[(None, chunk_offset + chunk_id), None]
                 gK = gK_tiles[(None, chunk_id), None]
 
-                # wait for MMA to release the buffer
-                cute.arch.mbarrier_wait(vk_done_mbar + stage_id, parity)
-
-                # load W, V (i.e. U), and K
+                ### load H0 and V
+                mbar0 = tma_v_mbar + stage_id
                 with cute.arch.elect_one():
-                    STAGE_SIZE = BT * (K_dim + V_dim + K_dim) * 2
+                    H0_size = V_dim * K_dim * self.h_dtype.width // 8
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar0, H0_size + V_size)
+                simple_tma_copy(
+                    H0_tma_atom,
+                    tmaH0[seq_id, head_id, None, None],
+                    sH0,
+                    mbar0,
+                    EVICT_FIRST,
+                )
+                simple_tma_copy(
+                    V_tma_atom, gV, sV[None, None, stage_id], mbar0, EVICT_FIRST
+                )
+
+                ### load W and K
+                # wait for MMA to release the buffer
+                mbar0 = tma_wk_mbar + stage_id
+                with cute.arch.elect_one():
+                    STAGE_SIZE = BT * K_dim * 2 * 2
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar0, STAGE_SIZE)
+                simple_tma_copy(
+                    W_tma_atom, gW, sW[None, None, stage_id], mbar0, EVICT_FIRST
+                )
+                simple_tma_copy(K_tma_atom, gK, sK[None, None, stage_id], mbar0)
+
+                stage_id = (stage_id + 1) % num_stages
+                if stage_id == 0:
+                    parity ^= 1
+
+            # subsequent chunks
+            for chunk_id in range(1, num_chunks):
+                gW = gW_tiles[(None, chunk_offset + chunk_id), None]
+                gV = gV_tiles[(None, chunk_offset + chunk_id), None]
+                gK = gK_tiles[(None, chunk_id), None]
+
+                ### load V (i.e. U)
+                # wait for V warps to release Vsmem
+                mbar = tma_v_mbar + stage_id
+                cute.arch.mbarrier_wait(wh_in_mbar + stage_id, parity)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar, V_size)
+                simple_tma_copy(
+                    V_tma_atom, gV, sV[None, None, stage_id], mbar, EVICT_FIRST
+                )
+
+                ### load W and K
+                # wait for MMA to release the buffer
+                mbar = tma_wk_mbar + stage_id
+                cute.arch.mbarrier_wait(vk_done_mbar + stage_id, parity)
+                with cute.arch.elect_one():
+                    STAGE_SIZE = BT * K_dim * 2 * 2
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar, STAGE_SIZE)
                 simple_tma_copy(
                     W_tma_atom, gW, sW[None, None, stage_id], mbar, EVICT_FIRST
-                )
-                simple_tma_copy(
-                    V_tma_atom, gV, sV[None, None, stage_id], mbar, EVICT_FIRST
                 )
                 simple_tma_copy(K_tma_atom, gK, sK[None, None, stage_id], mbar)
 
@@ -291,7 +330,7 @@ class Sm100ChunkHKernel:
                 hdesc0_base = sdesc_template | (Haddr0 >> 4)
                 wdesc0_base = sdesc_template | (Waddr0 >> 4)
 
-                cute.arch.mbarrier_wait(tma_mbar + stage_id, parity)
+                cute.arch.mbarrier_wait(tma_wk_mbar + stage_id, parity)
                 cute.arch.mbarrier_wait(wh_in_mbar + stage_id, parity)
                 _tcgen05.fence_after_thread_sync()
 
@@ -327,7 +366,7 @@ class Sm100ChunkHKernel:
                 Waddr = sW[None, None, stage_id].iterator.toint()
                 wdesc_base = sdesc_template | (Waddr >> 4)
 
-                cute.arch.mbarrier_wait(tma_mbar + stage_id, parity)
+                cute.arch.mbarrier_wait(tma_wk_mbar + stage_id, parity)
                 cute.arch.mbarrier_wait(wh_in_mbar + stage_id, parity)
                 _tcgen05.fence_after_thread_sync()
 
@@ -371,7 +410,7 @@ class Sm100ChunkHKernel:
             cp_16B = cute.make_copy_atom(op, Float32, num_bits_per_copy=128)
 
             ##### chunk_id = 0 #####
-            if True:
+            if cutlass.const_expr(True):
                 chunk_id = 0
                 end_t = min(bos + (chunk_id + 1) * BT, eos)
                 last_idx = end_t - 1
@@ -379,7 +418,7 @@ class Sm100ChunkHKernel:
 
                 # for 1st chunk, wait for H0 transfer from gmem
                 if warp_id_ == 0:
-                    cute.arch.mbarrier_wait(h0_mbar, 0)
+                    cute.arch.mbarrier_wait(tma_v_mbar, 0)
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
                 # when H0 is FP32, we need to pack it to BF16
@@ -567,7 +606,7 @@ class Sm100ChunkHKernel:
             for chunk_id in range(num_chunks):
                 # wait for V to arrive
                 if warp_id == 0:
-                    cute.arch.mbarrier_wait(tma_mbar + stage_id, parity)
+                    cute.arch.mbarrier_wait(tma_v_mbar + stage_id, parity)
                 cute.arch.barrier(barrier_id=2, number_of_threads=128)
 
                 # unpack V BF16->FP32, then store to tmem for 1st MMA
