@@ -53,7 +53,7 @@ class Sm100ChunkHKernel:
         self.num_warps = 10
 
     @cute.jit
-    def _make_bf16_tma_args(
+    def _make_tma_args(
         self,
         tensor: cute.Tensor,
         dim: cutlass.Constexpr[int],
@@ -110,10 +110,10 @@ class Sm100ChunkHKernel:
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
         tma_s2g = cpasync.CopyBulkTensorTileS2GOp()
 
-        K_args = self._make_bf16_tma_args(K, self.K_dim, tma_g2s, self.num_stages)
-        V_args = self._make_bf16_tma_args(V, self.V_dim, tma_g2s, self.num_stages)
-        W_args = self._make_bf16_tma_args(W, self.K_dim, tma_g2s, self.num_stages)
-        V_new_args = self._make_bf16_tma_args(V_new, self.V_dim, tma_s2g, 1)
+        K_args = self._make_tma_args(K, self.K_dim, tma_g2s, self.num_stages)
+        V_args = self._make_tma_args(V, self.V_dim, tma_g2s, self.num_stages)
+        W_args = self._make_tma_args(W, self.K_dim, tma_g2s, self.num_stages)
+        V_new_args = self._make_tma_args(V_new, self.V_dim, tma_s2g, 1)
         H0_args = self._make_h_tma_args(h0, tma_g2s)
         HT_args = self._make_h_tma_args(ht, tma_s2g)
         H_args = self._make_h_tma_args(h, tma_s2g)
