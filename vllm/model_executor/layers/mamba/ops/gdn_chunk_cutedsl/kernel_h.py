@@ -436,8 +436,8 @@ class Sm100ChunkHKernel:
                         )
 
                         # H smem layout: (V_dim, (64, K_dim/64))
-                        dst = cute.local_tile(sH[tid_, None], (32,), (i,))
-                        cute.copy(cp_16B, h_bf16, dst)
+                        sH_dst0 = cute.local_tile(sH[tid_, None], (32,), (i,))
+                        cute.copy(cp_16B, h_bf16, sH_dst0)
 
                 _tcgen05.wait_st()
                 _tcgen05.fence_before_thread_sync()
@@ -516,8 +516,8 @@ class Sm100ChunkHKernel:
                     )
 
                     # H smem layout: (V_dim, (64, K_dim/64))
-                    dst = cute.local_tile(sH[tid_, None], (32,), (i,))
-                    cute.copy(cp_16B, h_bf16, dst)
+                    sH_dst = cute.local_tile(sH[tid_, None], (32,), (i,))
+                    cute.copy(cp_16B, h_bf16, sH_dst)
 
                 _tcgen05.wait_st()
                 _tcgen05.fence_before_thread_sync()
