@@ -175,7 +175,16 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(x, residual)
+        if x.dtype == self.weight.dtype == torch.bfloat16:
+            from flashinfer.norm import gemma_fused_add_rmsnorm, gemma_rmsnorm
+
+            if residual is None:
+                return gemma_rmsnorm(x, self.weight, self.variance_epsilon)
+
+            gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
+            return x, residual
+
+        return x, residual
 
 
 # --8<-- [start:rms_norm_gated]
