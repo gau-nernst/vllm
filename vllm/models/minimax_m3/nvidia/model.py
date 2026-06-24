@@ -336,7 +336,10 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_alpha=config.swiglu_alpha,
             swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scale_to_output=True,
+            # Fused shared experts share one top-k list with routed experts.
+            # Apply routed_scaling_factor in the router so appended shared
+            # expert weights remain 1.0.
+            apply_routed_scale_to_output=not self.fuse_shared_experts,
             router_logits_dtype=self.gate.out_dtype,
             shared_experts=self.shared_experts,
             quant_config=quant_config,
