@@ -196,7 +196,6 @@ class HYV3MoEFused(nn.Module):
             topk_group=1,
             routed_scaling_factor=router_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
-            n_shared_experts=config.num_shared_experts,
             shared_experts=self.shared_mlp,
         )
 

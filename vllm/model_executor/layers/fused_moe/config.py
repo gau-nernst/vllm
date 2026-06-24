@@ -1290,6 +1290,10 @@ class FusedMoEConfig:
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
 
+    # Shared experts appended to the routed expert table. This is 0 when
+    # shared experts are executed as a separate module.
+    num_fused_shared_experts: int = 0
+
     max_capture_size: int = 0
 
     # Set by __post_init__

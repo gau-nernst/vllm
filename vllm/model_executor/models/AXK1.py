@@ -189,7 +189,7 @@ class AXK1MoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            n_shared_experts=config.n_shared_experts
+            num_fused_shared_experts=config.n_shared_experts
             if self.is_fusion_moe_shared_experts_enabled
             else None,
         )

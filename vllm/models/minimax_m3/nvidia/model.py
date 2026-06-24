@@ -23,6 +23,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -86,6 +87,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
+logger = init_logger(__name__)
+
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
     """Layer ids whose attention runs the extra sparse "index" branch."""
@@ -104,6 +107,75 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+def _should_fuse_shared_experts(
+    config: PretrainedConfig,
+    vllm_config: VllmConfig,
+    quant_config: QuantizationConfig | None,
+) -> bool:
+    parallel_config = vllm_config.parallel_config
+    n_shared_experts = getattr(config, "n_shared_experts", None)
+
+    if not parallel_config.enable_fuse_shared_experts or not n_shared_experts:
+        return False
+
+    # The loader remaps one shared MLP into one appended expert slot. Multiple
+    # shared experts need tensor chunking before remapping.
+    shared_expert_count_compatible = n_shared_experts == 1
+    shared_expert_compatible = True
+    if quant_config is not None:
+        # when there is quantization, check if shared experts are excluded
+        # we don't cover the case when shared and routed experts have different
+        # quantization schemes.
+        is_layer_excluded = getattr(quant_config, "is_layer_excluded", None)
+        if is_layer_excluded is not None:
+            is_shared_excluded = False
+            for layer_id in range(config.num_hidden_layers):
+                if not _is_moe_layer(config, layer_id):
+                    continue
+                shared_prefix = (
+                    f"model.layers.{layer_id}.block_sparse_moe.shared_experts"
+                )
+                is_shared_excluded = is_layer_excluded(
+                    shared_prefix
+                ) or is_layer_excluded(f"language_model.{shared_prefix}")
+                if is_shared_excluded:
+                    break
+            shared_expert_compatible = not is_shared_excluded
+
+    is_dep = (
+        parallel_config.data_parallel_size > 1
+        and parallel_config.tensor_parallel_size == 1
+        and parallel_config.enable_expert_parallel
+    )
+    is_dep = False  # TODO: support DEP
+    is_tp = (
+        parallel_config.data_parallel_size == 1
+        and parallel_config.tensor_parallel_size > 1
+        and not parallel_config.enable_expert_parallel
+    )
+    fuse_shared_experts = (
+        (is_dep or is_tp)
+        and shared_expert_count_compatible
+        and shared_expert_compatible
+    )
+    if fuse_shared_experts:
+        logger.info_once("MiniMax M3 shared expert fusion is enabled.")
+    else:
+        logger.info_once(
+            "MiniMax M3 shared expert fusion is disabled: "
+            "EP=%s, DP=%d, TP=%d, n_shared_experts=%d, "
+            "shared_expert_count_compatible=%s, "
+            "shared_expert_compatible=%s.",
+            parallel_config.enable_expert_parallel,
+            parallel_config.data_parallel_size,
+            parallel_config.tensor_parallel_size,
+            n_shared_experts,
+            shared_expert_count_compatible,
+            shared_expert_compatible,
+        )
+    return fuse_shared_experts
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -189,6 +261,7 @@ class MiniMaxM3MoE(nn.Module):
 
     def __init__(
         self,
+        vllm_config: VllmConfig,
         config: PretrainedConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
@@ -229,8 +302,13 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        self.fuse_shared_experts = _should_fuse_shared_experts(
+            config=config,
+            vllm_config=vllm_config,
+            quant_config=quant_config,
+        )
         self.shared_experts: MiniMaxM3MLP | None = None
-        if self.n_shared_experts:
+        if self.n_shared_experts and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.intermediate_size * self.n_shared_experts,
@@ -238,6 +316,9 @@ class MiniMaxM3MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+        num_fused_shared_experts = (
+            self.n_shared_experts if self.fuse_shared_experts else None
+        )
 
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
@@ -260,6 +341,7 @@ class MiniMaxM3MoE(nn.Module):
             shared_experts=self.shared_experts,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            num_fused_shared_experts=num_fused_shared_experts,
             reduce_results=reduce_results,
         )
 
@@ -692,6 +774,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
             self.block_sparse_moe = MiniMaxM3MoE(
+                vllm_config=vllm_config,
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
@@ -787,6 +870,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         else:
             self.topk_indices_buffer = None
 
+        self.fuse_shared_experts = _should_fuse_shared_experts(
+            config=config,
+            vllm_config=vllm_config,
+            quant_config=quant_config,
+        )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MiniMaxM3DecoderLayer(
@@ -841,12 +930,18 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Checkpoint experts use w1=gate, w2=down, w3=up.
+        num_experts = self.config.num_local_experts
+        n_shared_experts = getattr(self.config, "n_shared_experts", None)
+        if self.fuse_shared_experts and n_shared_experts:
+            # Include synthesized shared expert slots so remapped
+            # shared_experts weights can match expert_params_mapping.
+            num_experts += n_shared_experts
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
+            num_experts=num_experts,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -870,6 +965,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = self.get_expert_mapping()
+        # In fused shared expert mode, the shared MLP is loaded into the
+        # appended expert slot after the routed experts.
+        shared_slot = self.config.num_local_experts
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -882,6 +980,22 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             # ModelOpt MXFP8 layers expose them as ``weight_scale``.
             if "weight_scale_inv" in name:
                 name = name.replace("weight_scale_inv", "weight_scale")
+
+            if self.fuse_shared_experts and "shared_experts" in name:
+                # Redirect checkpoint shared expert weights to synthesized
+                # routed expert names so the existing expert-aware loader maps
+                # them into the appended local shared expert slot.
+                for src, dst in (
+                    ("gate_proj", "w1"),
+                    ("up_proj", "w3"),
+                    ("down_proj", "w2"),
+                ):
+                    if f"shared_experts.{src}" in name:
+                        name = name.replace(
+                            f"shared_experts.{src}",
+                            f"experts.{shared_slot}.{dst}",
+                        )
+                        break
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

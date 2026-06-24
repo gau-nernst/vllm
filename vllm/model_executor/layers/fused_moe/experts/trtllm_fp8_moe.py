@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -128,6 +129,10 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
     """
 
     @staticmethod
+    def _supports_fused_shared_experts() -> bool:
+        return True
+
+    @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
         return (
             not moe_parallel_config.use_all2all_kernels
@@ -224,6 +229,14 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             weight_layout = WeightLayout.BlockMajorK
             hidden_states_scale = a1q_scale.t().contiguous()
 
+        num_fused_shared_experts = self.moe_config.num_fused_shared_experts
+        # vLLM keeps global_num_experts as the routed expert count. FlashInfer
+        # validates against the full executable table and requires that count
+        # to be divisible by 4.
+        flashinfer_num_experts = global_num_experts + num_fused_shared_experts
+        if num_fused_shared_experts > 0:
+            flashinfer_num_experts = round_up(flashinfer_num_experts, 4)
+
         flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe(
             topk_ids=packed_topk_ids,
             routing_bias=None,
@@ -236,7 +249,7 @@ class TrtLlmFp8ExpertsModular(TrtLlmFp8ExpertsBase, mk.FusedMoEExpertsModular):
             gemm1_clamp_limit=self.gemm1_clamp_limit,
             gemm2_weights=w2,
             gemm2_weights_scale=self.quant_config.w2_scale,
-            num_experts=global_num_experts,
+            num_experts=flashinfer_num_experts,
             top_k=topk_ids.size(1),
             n_group=None,
             topk_group=None,

@@ -392,6 +392,10 @@ def rocm_aiter_fused_experts(
 
 
 class AiterExperts(mk.FusedMoEExpertsModular):
+    @staticmethod
+    def _supports_fused_shared_experts() -> bool:
+        return True
+
     @property
     def expects_unquantized_inputs(self) -> bool:
         # When paired with MoRI, the prepare/finalize handles FP8

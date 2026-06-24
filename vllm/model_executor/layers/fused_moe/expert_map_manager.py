@@ -99,6 +99,8 @@ def determine_expert_map(
         )
         expert_mask[-1] = 0
         expert_mask[:global_num_experts] = expert_map > -1
+
+    if num_fused_shared_experts > 0:
         expert_map = torch.cat(
             (
                 expert_map,

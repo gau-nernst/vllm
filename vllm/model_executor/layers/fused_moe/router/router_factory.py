@@ -182,6 +182,7 @@ def create_fused_moe_router(
         return FusedTopKBiasRouter(
             top_k=top_k,
             global_num_experts=global_num_experts,
+            num_fused_shared_experts=num_fused_shared_experts,
             eplb_state=eplb_state,
             e_score_correction_bias=e_score_correction_bias,
             renormalize=renormalize,

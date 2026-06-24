@@ -141,10 +141,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.shared_expert_gate",
         )
 
-        if (
+        fuse_shared_experts = (
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-            or config.shared_expert_intermediate_size <= 0
-        ):
+            and config.shared_expert_intermediate_size > 0
+        )
+        if fuse_shared_experts or config.shared_expert_intermediate_size <= 0:
             self.shared_expert = None
         else:
             self.shared_expert = Qwen3NextMLP(
@@ -171,10 +172,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            n_shared_experts=1 if self.shared_expert is None else None,
-            shared_expert_gate=self.shared_expert_gate
-            if self.shared_expert is None
-            else None,
+            num_fused_shared_experts=1 if fuse_shared_experts else None,
+            shared_expert_gate=self.shared_expert_gate if fuse_shared_experts else None,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -593,7 +592,10 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         num_experts = getattr(self.config, "num_experts", 0)
-        if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+        if (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+            and self.config.shared_expert_intermediate_size > 0
+        ):
             num_experts += 1
         return fused_moe_make_expert_params_mapping(
             self,
@@ -618,7 +620,10 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
 
-        is_fse = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        is_fse = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+            and self.config.shared_expert_intermediate_size > 0
+        )
         num_routed = getattr(self.config, "num_experts", 0)
 
         for name, loaded_weight in weights:

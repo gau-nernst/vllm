@@ -332,6 +332,7 @@ class FusedTopKBiasRouter(BaseRouter):
         routed_scaling_factor: float = 1.0,
         eplb_state: EplbLayerState | None = None,
         *,
+        num_fused_shared_experts: int = 0,
         scoring_func: str = "sigmoid",
         hash_indices_table: torch.Tensor | None = None,
     ):
@@ -346,6 +347,7 @@ class FusedTopKBiasRouter(BaseRouter):
         self.routed_scaling_factor = routed_scaling_factor
         self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
+        self.num_fused_shared_experts = num_fused_shared_experts
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -381,5 +383,20 @@ class FusedTopKBiasRouter(BaseRouter):
             hash_indices_table=self._hash_indices_table,
             routed_scaling_factor=self.routed_scaling_factor,
         )
+
+        # append (global) shared expert IDs and their weights (1.0)
+        # TODO: fuse this with existing router kernel
+        if self.num_fused_shared_experts > 0:
+            shared_ids = self.global_num_experts + torch.arange(
+                self.num_fused_shared_experts,
+                device=topk_ids.device,
+                dtype=topk_ids.dtype,
+            )
+            shared_ids = shared_ids.expand(topk_ids.shape[0], -1)
+            shared_weights = topk_weights.new_ones(
+                topk_weights.shape[0], self.num_fused_shared_experts
+            )
+            topk_ids = torch.cat([topk_ids, shared_ids], dim=1)
+            topk_weights = torch.cat([topk_weights, shared_weights], dim=1)
 
         return topk_weights, topk_ids

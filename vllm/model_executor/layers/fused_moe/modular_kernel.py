@@ -553,6 +553,11 @@ class FusedMoEExperts(ABC):
             return False, _make_reason(
                 f"quantization scheme {weight_key}x{activation_key}"
             )
+        elif (
+            moe_config.num_fused_shared_experts > 0
+            and not cls._supports_fused_shared_experts()
+        ):
+            return False, _make_reason("fused shared experts")
         elif not cls._supports_parallel_config(moe_config.moe_parallel_config):
             return False, _make_reason(
                 f"parallel config {moe_config.moe_parallel_config}"
@@ -651,6 +656,10 @@ class FusedMoEExperts(ABC):
         in addition to the experts if certain dtypes are not supported.
         """
         return True
+
+    @staticmethod
+    def _supports_fused_shared_experts() -> bool:
+        return False
 
     @staticmethod
     def _supports_shape(hidden_dim: int) -> bool:
