@@ -440,6 +440,11 @@ class DecodeBenchConnectorWorker:
 
         # Get the layers that belong to this group
         layer_names = self.group_to_layers.get(group_idx, [])
+        block_ids_tensor = async_tensor_h2d(
+            block_ids,
+            dtype=torch.long,
+            device=self.vllm_config.device_config.device,
+        )
 
         # Fill only the layers in this group
         for layer_name in layer_names:
@@ -459,7 +464,7 @@ class DecodeBenchConnectorWorker:
             # dimension — so fill each tensor in its entirety with the same
             # dummy values.
             if isinstance(kv_cache, torch.Tensor):
-                self._fill_block_tensor(kv_cache, block_ids)
+                self._fill_block_tensor(kv_cache, block_ids_tensor)
             elif isinstance(kv_cache, (list, tuple)) and all(
                 isinstance(t, torch.Tensor) for t in kv_cache
             ):
@@ -484,17 +489,13 @@ class DecodeBenchConnectorWorker:
             self.fill_std,
         )
 
-    def _fill_block_tensor(self, kv_cache: torch.Tensor, block_ids: list[int]):
+    def _fill_block_tensor(self, kv_cache: torch.Tensor, block_ids: torch.Tensor):
         """Fill the requested block rows of a block-indexed KV cache tensor.
 
         Args:
             kv_cache: A KV cache tensor whose first dim is num_blocks.
-            block_ids: Block IDs to fill.
+            block_ids_tensor: Block IDs to fill.
         """
-        block_ids_tensor = async_tensor_h2d(
-            block_ids, dtype=torch.long, device=kv_cache.device
-        )
-
         # Create fill values - either constant or random
         block_shape = kv_cache.shape[1:]
         if self.fill_std > 0:
@@ -506,10 +507,10 @@ class DecodeBenchConnectorWorker:
                 dtype=kv_cache.dtype,
                 device=kv_cache.device,
             )
-            kv_cache[block_ids_tensor] = fill_values
+            kv_cache[block_ids] = fill_values
         else:
             # Constant fill value
-            fill_kv_blocks(kv_cache, block_ids_tensor, self.fill_mean)
+            fill_kv_blocks(kv_cache, block_ids, self.fill_mean)
 
     def _fill_state_tensor(self, kv_cache: torch.Tensor):
         """Fill an entire non-block-indexed state tensor with dummy values.
