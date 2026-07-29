@@ -31,6 +31,7 @@ Usage:
           Set to 0 for constant values, >0 for random sampling
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +47,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionMetadata
 
 if TYPE_CHECKING:
@@ -345,13 +347,14 @@ class DecodeBenchConnectorWorker:
         assert self.kv_caches is not None, "KV caches must be registered before filling"
         assert self.group_to_layers is not None, "Group mapping must be initialized"
 
+        block_ids_by_group: dict[int, list[int]] = defaultdict(list)
         for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
             # Fill blocks for each KV cache group
             for group_idx, block_ids in enumerate(block_ids_per_group):
-                self._fill_blocks(group_idx, block_ids, num_tokens)
+                block_ids_by_group[group_idx].extend(block_ids)
 
             logger.debug(
-                "DecodeBenchConnector: Filled %d blocks (%d tokens) across %d groups "
+                "DecodeBenchConnector: Queued %d blocks (%d tokens) across %d groups "
                 "for request %s",
                 len(block_ids_per_group[0]) if block_ids_per_group else 0,
                 num_tokens,
@@ -359,14 +362,16 @@ class DecodeBenchConnectorWorker:
                 req_id,
             )
 
-    def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
+        for group_idx, block_ids in block_ids_by_group.items():
+            self._fill_blocks(group_idx, block_ids)
+
+    def _fill_blocks(self, group_idx: int, block_ids: list[int]):
         """
         Fill specified blocks with dummy non-zero values for a specific KV cache group.
 
         Args:
             group_idx: The KV cache group index to fill
             block_ids: List of block IDs to fill in this group
-            num_tokens: Total number of tokens to fill across these blocks
         """
         if not block_ids:
             return
@@ -428,17 +433,9 @@ class DecodeBenchConnectorWorker:
             block_ids: Block IDs to fill. IDs that are out of range for this
                 tensor's first dim are ignored.
         """
-        # Convert block_ids to tensor on device
-        block_ids_tensor = torch.tensor(
+        block_ids_tensor = async_tensor_h2d(
             block_ids, dtype=torch.long, device=kv_cache.device
         )
-
-        # Filter invalid block IDs
-        valid_mask = block_ids_tensor < kv_cache.shape[0]
-        valid_block_ids = block_ids_tensor[valid_mask]
-
-        if len(valid_block_ids) == 0:
-            return
 
         # Create fill values - either constant or random
         block_shape = kv_cache.shape[1:]
@@ -447,21 +444,21 @@ class DecodeBenchConnectorWorker:
             fill_values = torch.normal(
                 mean=self.fill_mean,
                 std=self.fill_std,
-                size=(len(valid_block_ids),) + block_shape,
+                size=(len(block_ids),) + block_shape,
                 dtype=kv_cache.dtype,
                 device=kv_cache.device,
             )
         else:
             # Constant fill value
             fill_values = torch.full(
-                (len(valid_block_ids),) + block_shape,
+                (1,),
                 self.fill_mean,
                 dtype=kv_cache.dtype,
                 device=kv_cache.device,
             )
 
         # Batch fill operation
-        kv_cache[valid_block_ids] = fill_values
+        kv_cache[block_ids_tensor] = fill_values
 
     def _fill_state_tensor(self, kv_cache: torch.Tensor):
         """Fill an entire non-block-indexed state tensor with dummy values.
