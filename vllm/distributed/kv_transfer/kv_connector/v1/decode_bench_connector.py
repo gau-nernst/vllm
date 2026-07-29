@@ -46,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionMetadata
@@ -59,6 +60,64 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@triton.jit(do_not_specialize=["fill_val"])
+def _fill_kv_blocks_kernel(
+    kv_cache_ptr,
+    block_ids_ptr,
+    fill_val,
+    page_size: tl.constexpr,
+    block_stride: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    chunks_per_page: tl.constexpr = triton.cdiv(page_size, CHUNK_SIZE)
+    chunk_id = pid % chunks_per_page
+    block_id_idx = pid // chunks_per_page
+
+    # Scheduler-owned block tables only contain valid allocation indices. The
+    # fallback fill paths rely on the same invariant, so no filtering is needed.
+    block_id = tl.load(block_ids_ptr + block_id_idx)
+    offs = chunk_id * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
+    tl.store(
+        kv_cache_ptr + block_id * block_stride + offs,
+        fill_val,
+        mask=offs < page_size,
+    )
+
+
+def fill_kv_blocks(
+    kv_cache: torch.Tensor, block_ids: torch.Tensor, fill_val: float | int
+):
+    # NHD pages are logically permuted but compact in physical stride order.
+    # Since every element gets the same value, filling that storage order is safe.
+    dims = (0, *sorted(range(1, kv_cache.ndim), key=kv_cache.stride, reverse=True))
+    storage_view = kv_cache.permute(dims)
+    page0 = storage_view[0]
+    if HAS_TRITON and kv_cache.is_cuda and page0.is_contiguous():
+        page_size = page0.numel()
+        CHUNK_SIZE = 4096 // kv_cache.element_size()  # 4 KB
+        chunks_per_page = triton.cdiv(page_size, CHUNK_SIZE)
+        grid = (block_ids.shape[0] * chunks_per_page,)
+        _fill_kv_blocks_kernel[grid](
+            storage_view,
+            block_ids,
+            fill_val,
+            page0.numel(),
+            storage_view.stride(0),
+            CHUNK_SIZE,
+        )
+    else:
+        # Some layouts split a logical page into disjoint regions (for example,
+        # K/V-first storage), so preserve stride-aware indexing for those cases.
+        fill_values = torch.full(
+            (1,),
+            fill_val,
+            dtype=kv_cache.dtype,
+            device=kv_cache.device,
+        )
+        kv_cache[block_ids] = fill_values
 
 
 @dataclass
@@ -430,8 +489,7 @@ class DecodeBenchConnectorWorker:
 
         Args:
             kv_cache: A KV cache tensor whose first dim is num_blocks.
-            block_ids: Block IDs to fill. IDs that are out of range for this
-                tensor's first dim are ignored.
+            block_ids: Block IDs to fill.
         """
         block_ids_tensor = async_tensor_h2d(
             block_ids, dtype=torch.long, device=kv_cache.device
@@ -448,17 +506,10 @@ class DecodeBenchConnectorWorker:
                 dtype=kv_cache.dtype,
                 device=kv_cache.device,
             )
+            kv_cache[block_ids_tensor] = fill_values
         else:
             # Constant fill value
-            fill_values = torch.full(
-                (1,),
-                self.fill_mean,
-                dtype=kv_cache.dtype,
-                device=kv_cache.device,
-            )
-
-        # Batch fill operation
-        kv_cache[block_ids_tensor] = fill_values
+            fill_kv_blocks(kv_cache, block_ids_tensor, self.fill_mean)
 
     def _fill_state_tensor(self, kv_cache: torch.Tensor):
         """Fill an entire non-block-indexed state tensor with dummy values.
