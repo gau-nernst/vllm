@@ -699,6 +699,20 @@ class KimiMoE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
+def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    """Single source of truth for Kimi-K3 sequence parallelism.
+
+    SP shards tokens across the TP group, so decoder layers, the model
+    wrapper, and the MoE parallel config must all agree on this value.
+    SP sharding is incompatible with PP intermediate states.
+    """
+    parallel_config = vllm_config.parallel_config
+    return (
+        parallel_config.pipeline_parallel_size == 1
+        and parallel_config.use_sequence_parallel_moe
+    )
+
+
 class KimiDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -715,7 +729,6 @@ class KimiDecoderLayer(nn.Module):
         layer_idx = self.layer_idx
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
         self.is_moe_layer = (
             self.is_moe
             and config.num_experts is not None
@@ -723,13 +736,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
             assert kda_config is not None
@@ -966,13 +973,17 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        if self.use_sequence_parallel:
+            logger.info(
+                "Sequence parallel enabled: pp=%d, tp=%d, dp=%d, "
+                "enable_expert_parallel=%s, moe_backend=%s",
+                parallel_config.pipeline_parallel_size,
+                parallel_config.tensor_parallel_size,
+                parallel_config.data_parallel_size,
+                parallel_config.enable_expert_parallel,
+                vllm_config.kernel_config.moe_backend,
+            )
 
         self.vocab_size = config.vocab_size
 

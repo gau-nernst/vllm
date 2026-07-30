@@ -172,8 +172,16 @@ class TrtLlmMxfp4ExpertsMonolithic(
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
+        # The AG/RS all2all path dispatches router logits and combines with
+        # reduce-scatter (MoEPrepareAndFinalizeNaiveDPEPMonolithic), which
+        # preserves monolithic semantics: the kernel still runs the router
+        # internally. Other all2all backends dispatch top-k ids/weights and
+        # therefore require modular experts.
         return (
-            not moe_parallel_config.use_all2all_kernels
+            (
+                not moe_parallel_config.use_all2all_kernels
+                or moe_parallel_config.use_ag_rs_all2all_kernels
+            )
             and not moe_parallel_config.enable_eplb
             and moe_parallel_config.dp_size <= 1
         )

@@ -111,15 +111,18 @@ def test_sp_padding_mask_marks_added_rows(
 
 
 @pytest.mark.parametrize(
-    ("data_parallel_size", "expected"),
+    ("data_parallel_size", "enable_sequence_parallel", "expected"),
     [
-        (1, False),
-        (2, True),
+        # DP>1 opts in automatically; DP=1 requires --enable-sequence-parallel.
+        (1, False, False),
+        (1, True, True),
+        (2, False, True),
     ],
 )
-def test_moe_sequence_parallel_requires_data_parallel(
+def test_moe_sequence_parallel_opt_in_at_dp1(
     monkeypatch,
     data_parallel_size: int,
+    enable_sequence_parallel: bool,
     expected: bool,
 ):
     monkeypatch.setattr(current_platform, "device_count", lambda: 2)
@@ -127,10 +130,29 @@ def test_moe_sequence_parallel_requires_data_parallel(
         tensor_parallel_size=2,
         data_parallel_size=data_parallel_size,
         enable_expert_parallel=True,
+        enable_sequence_parallel=enable_sequence_parallel,
         all2all_backend="allgather_reducescatter",
     )
 
     assert parallel_config.use_sequence_parallel_moe is expected
+
+
+def test_kimi_sequence_parallel_requires_single_pp_stage(monkeypatch):
+    monkeypatch.setattr(current_platform, "device_count", lambda: 2)
+
+    def make_vllm_config(pipeline_parallel_size):
+        return SimpleNamespace(
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=2,
+                pipeline_parallel_size=pipeline_parallel_size,
+                enable_expert_parallel=True,
+                enable_sequence_parallel=True,
+                all2all_backend="allgather_reducescatter",
+            )
+        )
+
+    assert kimi_model._use_sequence_parallel(make_vllm_config(1)) is True
+    assert kimi_model._use_sequence_parallel(make_vllm_config(2)) is False
 
 
 def test_kimi_decoder_layer_keeps_moe_states_sequence_sharded(monkeypatch):

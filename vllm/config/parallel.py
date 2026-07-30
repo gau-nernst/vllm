@@ -164,6 +164,10 @@ class ParallelConfig:
     """Whether the deployed model is MoE (if known)."""
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
+    enable_sequence_parallel: bool = False
+    """Enable sequence parallelism for MoE models, sharding tokens across the
+    tensor parallel group. Automatic when data_parallel_size > 1; this flag
+    opts in at data_parallel_size == 1."""
     enable_ep_weight_filter: bool = False
     """Skip non-local expert weights during model loading when expert
     parallelism is active.  Each rank only reads its own expert shard from
@@ -680,10 +684,14 @@ class ParallelConfig:
                 "mori_high_throughput",
                 "mori_low_latency",
                 "nixl_ep",
+                "flashinfer_all2allv",
+                "flashinfer_nvlink_two_sided",
+                "flashinfer_nvlink_one_sided",
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size > 1
+            # At DP=1, SP is opt-in via --enable-sequence-parallel.
+            and (self.data_parallel_size > 1 or self.enable_sequence_parallel)
         )
 
     @property
