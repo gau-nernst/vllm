@@ -69,6 +69,7 @@ from vllm.third_party.flash_linear_attention.ops.utils import (  # noqa: E402
     FLA_CHUNK_SIZE,
 )
 from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
+    GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
@@ -300,3 +301,121 @@ def test_forward_core_split_matches_unified(
         atol = rtol = 6e-2
     torch.testing.assert_close(out_split, out_unified, atol=atol, rtol=rtol)
     torch.testing.assert_close(ssm_state_split, ssm_state_unified, atol=atol, rtol=rtol)
+
+
+def test_forward_core_compacts_spec_gates_with_qkv() -> None:
+    """Speculative q/k/v and their token-wise gates must use the same order."""
+    device = torch.device("cuda")
+    spec_token_indx = torch.tensor([2, 3, 4], device=device)
+    non_spec_token_indx = torch.tensor([0, 1], device=device)
+    metadata = GDNAttentionMetadata(
+        num_prefills=1,
+        num_prefill_tokens=2,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=1,
+        num_spec_decode_tokens=3,
+        num_actual_tokens=5,
+        has_initial_state=torch.tensor([True], device=device),
+        spec_query_start_loc=torch.tensor([0, 3], dtype=torch.int32, device=device),
+        non_spec_query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        spec_state_indices_tensor=torch.tensor(
+            [[1, 2, 3]], dtype=torch.int32, device=device
+        ),
+        non_spec_state_indices_tensor=torch.tensor(
+            [4], dtype=torch.int32, device=device
+        ),
+        spec_sequence_masks=torch.tensor([False, True], device=device),
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=non_spec_token_indx,
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32, device=device),
+        prefill_query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        prefill_state_indices=torch.tensor([4], dtype=torch.int32, device=device),
+        prefill_has_initial_state=torch.tensor([True], device=device),
+    )
+
+    layer = types.SimpleNamespace(
+        prefix=PREFIX,
+        enable_packed_recurrent_decode=False,
+        tp_size=1,
+        num_k_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        activation="silu",
+        A_log=torch.zeros(HV, dtype=torch.float32, device=device),
+        dt_bias=torch.zeros(HV, dtype=torch.float32, device=device),
+        conv1d=types.SimpleNamespace(
+            weight=torch.zeros(1, 1, 1, dtype=torch.bfloat16, device=device),
+            bias=None,
+        ),
+        kv_cache=(
+            torch.zeros(5, 1, 1, dtype=torch.bfloat16, device=device),
+            torch.zeros(5, 1, 1, 1, dtype=torch.float32, device=device),
+        ),
+    )
+
+    def rearrange_mixed_qkv(self, mixed_qkv):
+        packed = mixed_qkv.unsqueeze(0)
+        return packed, packed, packed
+
+    def chunk_gated_delta_rule(*, q, initial_state, **kwargs):
+        output = q.new_zeros((1, q.size(1), HV, V))
+        return output, initial_state.clone()
+
+    layer.rearrange_mixed_qkv = types.MethodType(rearrange_mixed_qkv, layer)
+    layer._forward_core = types.MethodType(
+        QwenGatedDeltaNetAttention._forward_core, layer
+    )
+    layer.chunk_gated_delta_rule = chunk_gated_delta_rule
+
+    mixed_qkv = torch.arange(5, dtype=torch.bfloat16, device=device).unsqueeze(1)
+    a = torch.arange(5, dtype=torch.bfloat16, device=device).unsqueeze(1).expand(-1, HV)
+    b = (a + 10).clone()
+    core_attn_out = torch.zeros(5, HV, V, dtype=torch.bfloat16, device=device)
+    captured_gates = {}
+
+    def recurrent_update(*, a, b, q, **kwargs):
+        captured_gates["a"] = a
+        captured_gates["b"] = b
+        return q.new_zeros((1, q.size(1), HV, V)), None
+
+    def post_conv_prep(*, conv_output, **kwargs):
+        num_tokens = conv_output.size(0)
+        qkv = conv_output.new_zeros((num_tokens, HV, V))
+        gates = conv_output.new_zeros((num_tokens, HV))
+        return qkv, qkv, qkv, gates, gates
+
+    context = types.SimpleNamespace(attn_metadata={PREFIX: metadata})
+    with (
+        patch.object(qwen_gdn_linear_attn, "get_forward_context", return_value=context),
+        patch.object(
+            qwen_gdn_linear_attn,
+            "causal_conv1d_update",
+            side_effect=lambda mixed, *args, **kwargs: mixed,
+        ),
+        patch.object(
+            qwen_gdn_linear_attn,
+            "causal_conv1d_fn",
+            side_effect=lambda mixed, *args, **kwargs: mixed,
+        ),
+        patch.object(
+            qwen_gdn_linear_attn,
+            "fused_post_conv_prep",
+            side_effect=post_conv_prep,
+        ),
+        patch.object(
+            qwen_gdn_linear_attn,
+            "fused_sigmoid_gating_delta_rule_update",
+            side_effect=recurrent_update,
+        ),
+    ):
+        layer._forward_core(
+            mixed_qkv=mixed_qkv,
+            b=b,
+            a=a,
+            core_attn_out=core_attn_out,
+        )
+
+    torch.testing.assert_close(captured_gates["a"], a.index_select(0, spec_token_indx))
+    torch.testing.assert_close(captured_gates["b"], b.index_select(0, spec_token_indx))
