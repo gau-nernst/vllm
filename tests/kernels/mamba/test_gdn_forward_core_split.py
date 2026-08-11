@@ -52,7 +52,7 @@ from tests.v1.attention.utils import (  # noqa: E402
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import set_current_vllm_config  # noqa: E402
+from vllm.config import SpeculativeConfig, set_current_vllm_config  # noqa: E402
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn  # noqa: E402
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (  # noqa: E402
     ChunkGatedDeltaRule,
@@ -87,7 +87,7 @@ BLOCK_SIZE = 16
 PREFIX = "model.layers.0.linear_attn"
 
 
-def _make_vllm_config():
+def _make_vllm_config(num_speculative_tokens: int = 0):
     # A small, ungated GDN model whose config is cached locally; only the config
     # (scheduler/cache/compilation/hf) is used here, never the weights. Inject
     # linear_key_head_dim=128 and request the CuteDSL prefill backend -- the
@@ -100,6 +100,11 @@ def _make_vllm_config():
         hf_config_override={"linear_key_head_dim": K},
     )
     cfg.additional_config = {"gdn_prefill_backend": "cutedsl"}
+    if num_speculative_tokens > 0:
+        cfg.cache_config.mamba_cache_mode = "none"
+        cfg.speculative_config = SpeculativeConfig(
+            method="ngram", num_speculative_tokens=num_speculative_tokens
+        )
     return cfg
 
 
@@ -304,118 +309,116 @@ def test_forward_core_split_matches_unified(
 
 
 def test_forward_core_compacts_spec_gates_with_qkv() -> None:
-    """Speculative q/k/v and their token-wise gates must use the same order."""
+    """Mixed-batch request order must not change speculative outputs."""
+    torch.manual_seed(1)
     device = torch.device("cuda")
-    spec_token_indx = torch.tensor([2, 3, 4], device=device)
-    non_spec_token_indx = torch.tensor([0, 1], device=device)
-    metadata = GDNAttentionMetadata(
-        num_prefills=1,
-        num_prefill_tokens=2,
-        num_decodes=0,
-        num_decode_tokens=0,
-        num_spec_decodes=1,
-        num_spec_decode_tokens=3,
-        num_actual_tokens=5,
-        has_initial_state=torch.tensor([True], device=device),
-        spec_query_start_loc=torch.tensor([0, 3], dtype=torch.int32, device=device),
-        non_spec_query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
-        spec_state_indices_tensor=torch.tensor(
-            [[1, 2, 3]], dtype=torch.int32, device=device
-        ),
-        non_spec_state_indices_tensor=torch.tensor(
-            [4], dtype=torch.int32, device=device
-        ),
-        spec_sequence_masks=torch.tensor([False, True], device=device),
-        spec_token_indx=spec_token_indx,
-        non_spec_token_indx=non_spec_token_indx,
-        num_accepted_tokens=torch.ones(1, dtype=torch.int32, device=device),
-        prefill_query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
-        prefill_state_indices=torch.tensor([4], dtype=torch.int32, device=device),
-        prefill_has_initial_state=torch.tensor([True], device=device),
-    )
+    num_speculative_tokens = 2
+    prefill_tokens = 5
+    spec_tokens = num_speculative_tokens + 1
+    vllm_config = _make_vllm_config(num_speculative_tokens)
 
-    layer = types.SimpleNamespace(
-        prefix=PREFIX,
-        enable_packed_recurrent_decode=False,
-        tp_size=1,
-        num_k_heads=H,
-        num_v_heads=HV,
-        head_k_dim=K,
-        head_v_dim=V,
-        activation="silu",
-        A_log=torch.zeros(HV, dtype=torch.float32, device=device),
-        dt_bias=torch.zeros(HV, dtype=torch.float32, device=device),
-        conv1d=types.SimpleNamespace(
-            weight=torch.zeros(1, 1, 1, dtype=torch.bfloat16, device=device),
-            bias=None,
-        ),
-        kv_cache=(
-            torch.zeros(5, 1, 1, dtype=torch.bfloat16, device=device),
-            torch.zeros(5, 1, 1, 1, dtype=torch.float32, device=device),
-        ),
-    )
-
-    def rearrange_mixed_qkv(self, mixed_qkv):
-        packed = mixed_qkv.unsqueeze(0)
-        return packed, packed, packed
-
-    def chunk_gated_delta_rule(*, q, initial_state, **kwargs):
-        output = q.new_zeros((1, q.size(1), HV, V))
-        return output, initial_state.clone()
-
-    layer.rearrange_mixed_qkv = types.MethodType(rearrange_mixed_qkv, layer)
-    layer._forward_core = types.MethodType(
-        QwenGatedDeltaNetAttention._forward_core, layer
-    )
-    layer.chunk_gated_delta_rule = chunk_gated_delta_rule
-
-    mixed_qkv = torch.arange(5, dtype=torch.bfloat16, device=device).unsqueeze(1)
-    a = torch.arange(5, dtype=torch.bfloat16, device=device).unsqueeze(1).expand(-1, HV)
-    b = (a + 10).clone()
-    core_attn_out = torch.zeros(5, HV, V, dtype=torch.bfloat16, device=device)
-    captured_gates = {}
-
-    def recurrent_update(*, a, b, q, **kwargs):
-        captured_gates["a"] = a
-        captured_gates["b"] = b
-        return q.new_zeros((1, q.size(1), HV, V)), None
-
-    def post_conv_prep(*, conv_output, **kwargs):
-        num_tokens = conv_output.size(0)
-        qkv = conv_output.new_zeros((num_tokens, HV, V))
-        gates = conv_output.new_zeros((num_tokens, HV))
-        return qkv, qkv, qkv, gates, gates
-
-    context = types.SimpleNamespace(attn_metadata={PREFIX: metadata})
-    with (
-        patch.object(qwen_gdn_linear_attn, "get_forward_context", return_value=context),
-        patch.object(
-            qwen_gdn_linear_attn,
-            "causal_conv1d_update",
-            side_effect=lambda mixed, *args, **kwargs: mixed,
-        ),
-        patch.object(
-            qwen_gdn_linear_attn,
-            "causal_conv1d_fn",
-            side_effect=lambda mixed, *args, **kwargs: mixed,
-        ),
-        patch.object(
-            qwen_gdn_linear_attn,
-            "fused_post_conv_prep",
-            side_effect=post_conv_prep,
-        ),
-        patch.object(
-            qwen_gdn_linear_attn,
-            "fused_sigmoid_gating_delta_rule_update",
-            side_effect=recurrent_update,
-        ),
-    ):
-        layer._forward_core(
-            mixed_qkv=mixed_qkv,
-            b=b,
-            a=a,
-            core_attn_out=core_attn_out,
+    def build_metadata(spec_first: bool) -> GDNAttentionMetadata:
+        batch = BatchSpec(
+            seq_lens=[64, prefill_tokens] if spec_first else [prefill_tokens, 64],
+            query_lens=(
+                [spec_tokens, prefill_tokens]
+                if spec_first
+                else [prefill_tokens, spec_tokens]
+            ),
         )
+        builder = GDNAttentionMetadataBuilder(
+            kv_cache_spec=MambaSpec(
+                block_size=BLOCK_SIZE,
+                shapes=((16, 64),),
+                dtypes=(torch.float16,),
+                num_speculative_blocks=num_speculative_tokens,
+            ),
+            layer_names=[PREFIX],
+            vllm_config=vllm_config,
+            device=device,
+        )
+        common = create_common_attn_metadata(
+            batch, BLOCK_SIZE, device, arange_block_indices=True
+        )
+        common.block_table_tensor.add_(1)
+        draft_tokens = [num_speculative_tokens, -1]
+        if not spec_first:
+            draft_tokens.reverse()
+        with set_current_vllm_config(vllm_config):
+            return builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common,
+                num_accepted_tokens=torch.ones(2, dtype=torch.int32, device=device),
+                num_decode_draft_tokens_cpu=torch.tensor(
+                    draft_tokens, dtype=torch.int32
+                ),
+            )
 
-    torch.testing.assert_close(captured_gates["a"], a.index_select(0, spec_token_indx))
-    torch.testing.assert_close(captured_gates["b"], b.index_select(0, spec_token_indx))
+    metadata_spec_first = build_metadata(spec_first=True)
+    metadata_prefill_first = build_metadata(spec_first=False)
+    state_indices = (
+        metadata_spec_first.spec_state_indices_tensor,
+        metadata_spec_first.non_spec_state_indices_tensor,
+        metadata_prefill_first.spec_state_indices_tensor,
+        metadata_prefill_first.non_spec_state_indices_tensor,
+    )
+    pool_size = (
+        max(
+            int(indices.max().item())
+            for indices in state_indices
+            if indices is not None
+        )
+        + 1
+    )
+    conv_state_shape, temporal_state_shape = (
+        MambaStateShapeCalculator.gated_delta_net_state_shape(
+            1, H, HV, K, V, CONV_KERNEL, num_speculative_tokens
+        )
+    )
+    conv_state = torch.zeros(
+        pool_size, *conv_state_shape, dtype=torch.bfloat16, device=device
+    )
+    ssm_state = torch.zeros(
+        pool_size, *temporal_state_shape, dtype=torch.float32, device=device
+    )
+    A_log = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device) * 0.1
+    conv_weight = (
+        torch.randn(CONV_DIM, 1, CONV_KERNEL, dtype=torch.bfloat16, device=device) * 0.1
+    )
+    conv_bias = torch.randn(CONV_DIM, dtype=torch.bfloat16, device=device) * 0.1
+    prefill_qkv = torch.randn(
+        prefill_tokens, CONV_DIM, dtype=torch.bfloat16, device=device
+    )
+    spec_qkv = torch.randn(spec_tokens, CONV_DIM, dtype=torch.bfloat16, device=device)
+    prefill_a = torch.full(
+        (prefill_tokens, HV), 5.0, dtype=torch.bfloat16, device=device
+    )
+    prefill_b = torch.full_like(prefill_a, -5.0)
+    spec_a = torch.full((spec_tokens, HV), -5.0, dtype=torch.bfloat16, device=device)
+    spec_b = torch.full_like(spec_a, 5.0)
+
+    def run(spec_first: bool) -> torch.Tensor:
+        layer = _build_layer(
+            vllm_config,
+            conv_state.clone(),
+            ssm_state.clone(),
+            A_log,
+            dt_bias,
+            conv_weight,
+            conv_bias,
+        )
+        tensors = (
+            (spec_qkv, spec_b, spec_a, prefill_qkv, prefill_b, prefill_a)
+            if spec_first
+            else (prefill_qkv, prefill_b, prefill_a, spec_qkv, spec_b, spec_a)
+        )
+        qkv = torch.cat((tensors[0], tensors[3]))
+        b = torch.cat((tensors[1], tensors[4]))
+        a = torch.cat((tensors[2], tensors[5]))
+        metadata = metadata_spec_first if spec_first else metadata_prefill_first
+        return _run_forward_core(layer, metadata, qkv, b, a, qkv.size(0))
+
+    output_spec_first = run(spec_first=True)[:spec_tokens]
+    output_prefill_first = run(spec_first=False)[prefill_tokens:]
+    torch.testing.assert_close(output_prefill_first, output_spec_first, atol=0, rtol=0)
