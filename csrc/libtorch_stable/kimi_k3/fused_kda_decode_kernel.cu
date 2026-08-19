@@ -79,53 +79,61 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
   return value;
 }
 
-__device__ __forceinline__ void cp_async_cg_16b(float* smem_ptr,
-                                                const float* gmem_ptr) {
-  uint32_t smem_addr =
-      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+template <typename T>
+__device__ __forceinline__ uint32_t shared_address(T* ptr) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+}
+
+__device__ __forceinline__ void tma_load_1d(void* smem_ptr,
+                                            const void* gmem_ptr,
+                                            uint32_t bytes, uint64_t* barrier) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1], %2, [%3];"
+      :
+      : "r"(shared_address(smem_ptr)), "l"(gmem_ptr), "r"(bytes),
+        "r"(shared_address(barrier))
+      : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_init(uint64_t* barrier,
+                                              uint32_t count) {
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;"
                :
-               : "r"(smem_addr), "l"(gmem_ptr));
+               : "r"(shared_address(barrier)), "r"(count));
 }
 
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n" ::);
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* barrier,
+                                                          uint32_t bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+               :
+               : "r"(shared_address(barrier)), "r"(bytes));
 }
 
-__device__ __forceinline__ void cp_async_wait_all() {
-  asm volatile("cp.async.wait_all;\n" ::: "memory");
+__device__ __forceinline__ void mbarrier_wait_parity(uint64_t* barrier,
+                                                     uint32_t parity) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n\t"
+      "@!p bra WAIT_%=;\n\t}"
+      :
+      : "r"(shared_address(barrier)), "r"(parity));
 }
 
-__device__ __forceinline__ void cp_async_wait_group_1() {
-  asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+__device__ __forceinline__ void fence_async_shared() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
-template <int kCopyThreads>
-__device__ __forceinline__ void cp_async_state_chunk_for(float* s_state,
-                                                         const float* state,
-                                                         int slot, int i_hv,
-                                                         int HV, int chunk) {
-  constexpr int kFloat4PerChunk = kChunkV * kDimK / 4;
-  const int tid = threadIdx.x;
-  const int stage = chunk & 1;
-  const int v_base = chunk * kChunkV;
-  for (int linear4 = tid; linear4 < kFloat4PerChunk; linear4 += kCopyThreads) {
-    const int elem = linear4 * 4;
-    const int row = elem / kDimK;
-    const int k = elem - row * kDimK;
-    float* dst = s_state + (stage * kChunkV + row) * kDimK + k;
-    const float* src =
-        state + ((slot * HV + i_hv) * kDimV + v_base + row) * kDimK + k;
-    cp_async_cg_16b(dst, src);
-  }
-  cp_async_commit();
-}
-
-__device__ __forceinline__ void cp_async_state_chunk(float* s_state,
-                                                     const float* state,
-                                                     int slot, int i_hv, int HV,
-                                                     int chunk) {
-  cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, HV, chunk);
+__device__ __forceinline__ void tma_state_chunk(float* s_state,
+                                                const float* state, int i_hv,
+                                                int chunk, int stage,
+                                                uint64_t* barrier) {
+  constexpr uint32_t kBytes = kChunkV * kDimK * sizeof(float);
+  float* dst = s_state + stage * kChunkV * kDimK;
+  const float* src = state + (i_hv * kDimV + chunk * kChunkV) * kDimK;
+  fence_async_shared();
+  mbarrier_arrive_expect_tx(barrier, kBytes);
+  tma_load_1d(dst, src, kBytes, barrier);
 }
 
 __device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
@@ -261,15 +269,14 @@ __device__ __forceinline__ Sum2 block_reduce_sum2_active_for(float x, float y,
   return {scratch[0], scratch[1]};
 }
 
-template <bool kApplyOnorm, bool kUseStaticDecodeLayout = false,
-          int kFixedHeads = 0, int kFixedValueHeads = 0,
-          bool kUseHeadGrid = false, bool kAccumulateOnormSumsq = false,
-          bool kUseActiveQkReduction = false, bool kUseCacheGlobalStore = false,
-          bool kComputeOutputBeforeStore = false, bool kSkipWarpSync = false,
-          bool kPreloadOnormParams = false,
-          bool kPrefetchNextStateChunk = false,
-          bool kUseActiveOnormReduction = false, bool kUpdateConvState = false,
-          bool kUseLowerBound = false, bool kApplyBetaSigmoid = true>
+template <
+    bool kApplyOnorm, bool kUseStaticDecodeLayout = false, int kFixedHeads = 0,
+    int kFixedValueHeads = 0, bool kUseHeadGrid = false,
+    bool kAccumulateOnormSumsq = false, bool kUseActiveQkReduction = false,
+    bool kUseCacheGlobalStore = false, bool kComputeOutputBeforeStore = false,
+    bool kPreloadOnormParams = false, bool kUseActiveOnormReduction = false,
+    bool kUpdateConvState = false, bool kUseLowerBound = false,
+    bool kApplyBetaSigmoid = true, int kTmaStages = kNumChunks>
 __global__
 __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
     const __nv_bfloat16* __restrict__ x_q,
@@ -332,14 +339,13 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   constexpr int kPackedDim = 3 * kLocalDim;
   const int hk_off = i_h * kDimK;
   const int hv_off = i_hv * kDimV;
-  constexpr int hv_count = kFixedValueHeads;
   float* const state_for_slot = state + slot * strides.state_slot;
   const int64_t conv_slot_offset = slot * strides.conv_slot;
   __nv_bfloat16* const cs_q_for_slot = cs_q + conv_slot_offset;
   __nv_bfloat16* const cs_k_for_slot = cs_k + conv_slot_offset;
   __nv_bfloat16* const cs_v_for_slot = cs_v + conv_slot_offset;
 
-  __shared__ float s_state[2][kChunkV][kDimK];
+  extern __shared__ __align__(16) float s_state[];
   __shared__ float s_q[kDimK];
   __shared__ float s_k[kDimK];
   __shared__ float s_decay[kDimK];
@@ -347,10 +353,21 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   __shared__ float s_o[kDimV];
   __shared__ float s_reduce[kThreads];
   __shared__ float s_beta;
+  __shared__ uint64_t s_tma_bar[kNumChunks];
   float pre_onorm_gate = 0.0f;
   float pre_onorm_weight = 0.0f;
 
-  cp_async_state_chunk(&s_state[0][0][0], state_for_slot, 0, i_hv, hv_count, 0);
+  // Start the first two chunks while the convolution work hides TMA latency.
+  if (tid == 0) {
+#pragma unroll
+    for (int stage = 0; stage < kTmaStages; ++stage) {
+      mbarrier_init(&s_tma_bar[stage], 1);
+    }
+    tma_state_chunk(s_state, state_for_slot, i_hv, 0, 0, &s_tma_bar[0]);
+    if constexpr (kTmaStages > 1 && kNumChunks > 1) {
+      tma_state_chunk(s_state, state_for_slot, i_hv, 1, 1, &s_tma_bar[1]);
+    }
+  }
 
   if constexpr (kUpdateConvState) {
     if (tid < kDimK) {
@@ -510,11 +527,6 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
   }
   __syncthreads();
 
-  if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
-    cp_async_state_chunk(&s_state[0][0][0], state_for_slot, 0, i_hv, hv_count,
-                         1);
-  }
-
   const float q_sq = tid < kDimK ? s_q[tid] * s_q[tid] : 0.0f;
   const float k_sq = tid < kDimK ? s_k[tid] * s_k[tid] : 0.0f;
   Sum2 qk_sum;
@@ -540,25 +552,14 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
 
 #pragma unroll
   for (int chunk = 0; chunk < kNumChunks; ++chunk) {
-    if constexpr (kPrefetchNextStateChunk && kNumChunks > 1) {
-      if (chunk + 1 < kNumChunks) {
-        cp_async_wait_group_1();
-      } else {
-        cp_async_wait_all();
-      }
-    } else {
-      cp_async_wait_all();
+    if (tid == 0 && chunk + 2 < kNumChunks && chunk + 2 < kTmaStages) {
+      tma_state_chunk(s_state, state_for_slot, i_hv, chunk + 2, chunk + 2,
+                      &s_tma_bar[chunk + 2]);
     }
-    if constexpr (!kSkipWarpSync) {
-      __syncwarp();
-    }
+    mbarrier_wait_parity(&s_tma_bar[chunk % kTmaStages],
+                         (chunk / kTmaStages) & 1);
 
-    if constexpr (!kPrefetchNextStateChunk) {
-      if (chunk + 1 < kNumChunks) {
-        cp_async_state_chunk(&s_state[0][0][0], state_for_slot, 0, i_hv,
-                             hv_count, chunk + 1);
-      }
-    }
+    const float* state_stage = s_state + (chunk % kTmaStages) * kChunkV * kDimK;
 
 #pragma unroll
     for (int row = 0; row < kRowsPerWarp; row += 2) {
@@ -572,9 +573,9 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       float dot_hk_b = 0.0f;
 
       const float4 raw_h_a = *reinterpret_cast<const float4*>(
-          &s_state[chunk & 1][v_row_a][k_base]);
+          state_stage + v_row_a * kDimK + k_base);
       const float4 raw_h_b = *reinterpret_cast<const float4*>(
-          &s_state[chunk & 1][v_row_b][k_base]);
+          state_stage + v_row_b * kDimK + k_base);
       h_a_vals[0] = raw_h_a.x * r_decay[0];
       h_a_vals[1] = raw_h_a.y * r_decay[1];
       h_a_vals[2] = raw_h_a.z * r_decay[2];
@@ -638,10 +639,14 @@ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
       }
     }
 
-    if constexpr (kPrefetchNextStateChunk) {
-      if (chunk + 2 < kNumChunks) {
-        cp_async_state_chunk(&s_state[0][0][0], state_for_slot, 0, i_hv,
-                             hv_count, chunk + 2);
+    if constexpr (kTmaStages < kNumChunks) {
+      if (chunk + kTmaStages < kNumChunks) {
+        // All warps must release this stage before its barrier phase flips.
+        __syncthreads();
+        if (tid == 0) {
+          tma_state_chunk(s_state, state_for_slot, i_hv, chunk + kTmaStages,
+                          chunk % kTmaStages, &s_tma_bar[chunk % kTmaStages]);
+        }
       }
     }
   }
@@ -734,13 +739,28 @@ void launch_kda_decode_many_heads_raw(
     void* out, int B, int H, int HV, float lower_bound, float scale,
     float onorm_eps, KdaDecodeStrides strides, cudaStream_t stream) {
   auto kernel = &kda_decode_fusion_many_heads_kernel<
-      kApplyOnorm, true, kHeads, kHeads, true, false, false, false, false,
-      false, true, true, true, kUpdateConvState, kUseLowerBound,
-      kApplyBetaSigmoid>;
+      kApplyOnorm, true, kHeads, kHeads, true, false, false, false, false, true,
+      true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid, 4>;
+  // Four resident chunks avoid stage reuse; three preserve occupancy once the
+  // grid is large enough. This is the crossover used by the SGLang kernel.
+  int const tma_stages = B * kHeads >= 512 ? 3 : 4;
+  if (tma_stages == 3) {
+    kernel = &kda_decode_fusion_many_heads_kernel<
+        kApplyOnorm, true, kHeads, kHeads, true, false, false, false, false,
+        true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid, 3>;
+  }
+  size_t const smem_bytes =
+      static_cast<size_t>(tma_stages) * kChunkV * kDimK * sizeof(float);
+  cudaError_t const attr_error =
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           static_cast<int>(smem_bytes));
+  STD_TORCH_CHECK(attr_error == cudaSuccess,
+                  "Failed to set KDA decode dynamic shared memory: ",
+                  cudaGetErrorString(attr_error));
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(B, kHeads);
   config.blockDim = dim3(kThreads);
-  config.dynamicSmemBytes = 0;
+  config.dynamicSmemBytes = smem_bytes;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1035,6 +1055,10 @@ void fused_kda_decode(
                       state.stride(1) == kHeadDim * kHeadDim &&
                       state.stride(2) == kHeadDim && state.stride(3) == 1,
                   "state must have contiguous [H, 128, 128] slot contents");
+  STD_TORCH_CHECK(state.stride(0) % 4 == 0,
+                  "state slot stride must be 16-byte aligned for TMA loads");
+  STD_TORCH_CHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0,
+                  "state data pointer must be 16-byte aligned for TMA loads");
   STD_TORCH_CHECK(raw_g.is_contiguous(), "raw_g must be contiguous");
   STD_TORCH_CHECK(raw_beta.stride(2) == 1,
                   "raw_beta must be contiguous in its head dimension");
