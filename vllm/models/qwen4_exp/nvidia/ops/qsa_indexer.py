@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton kernels for Qwen4Exp QSA index selection."""
 
+from functools import cache
+
 import torch
 
 import vllm.envs as envs
@@ -13,6 +15,21 @@ from vllm.triton_utils import tl, triton
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
+
+
+@cache
+def _qsa_score_cutedsl_module():
+    """The CuteDSL paged score kernel module when the platform supports it.
+
+    The kernel is TMA-based (SM90+) and currently validated only for SM100.
+    """
+    if not (current_platform.is_cuda() and current_platform.has_device_capability(90)):
+        return None
+    try:
+        from vllm.models.qwen4_exp.nvidia.ops import qsa_score_cutedsl
+    except ImportError:
+        return None
+    return qsa_score_cutedsl
 
 
 @triton.jit
@@ -362,6 +379,17 @@ def warmup_qsa_mqa_paged_decode(
                 triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
             ),
         )
+
+    cutedsl = _qsa_score_cutedsl_module()
+    if cutedsl is not None:
+        profiles += cutedsl.warmup_qsa_paged_score_cutedsl(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            max_decode_query_len=max_decode_query_len,
+            max_num_reqs=max_num_reqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
     return profiles
 
 
@@ -515,31 +543,39 @@ def qsa_select_paged_decode(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
-    tiles_per_program = _decode_tiles_per_program(num_requests, columns)
-    grid = (
-        num_requests,
-        triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
-    )
-    _qsa_mqa_paged_uniform_kernel[grid](
-        q,
-        k_cache,
-        page_table,
-        visible_blocks,
-        logits,
-        *q.stride()[:-1],
-        *k_cache.stride()[:2],
-        *page_table.stride()[:-1],
-        *logits.stride()[:-1],
-        PAGE_SIZE=k_cache.shape[1],
-        PAGE_TABLE_WIDTH=page_table.shape[1],
-        NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
-        DECODE_QUERY_LEN=decode_query_len,
-        BLOCK_N=_DECODE_BLOCK_N,
-        TILES_PER_PROG=tiles_per_program,
-        STAGES=2,
-        num_warps=2,
-    )
+    cutedsl = _qsa_score_cutedsl_module()
+    if cutedsl is not None and cutedsl.qsa_score_cutedsl_supported(
+        q, k_cache, page_table, decode_query_len
+    ):
+        cutedsl.qsa_paged_score_cutedsl(
+            q, k_cache, page_table, visible_blocks, logits, decode_query_len
+        )
+    else:
+        tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+        grid = (
+            num_requests,
+            triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+        )
+        _qsa_mqa_paged_uniform_kernel[grid](
+            q,
+            k_cache,
+            page_table,
+            visible_blocks,
+            logits,
+            *q.stride()[:-1],
+            *k_cache.stride()[:2],
+            *page_table.stride()[:-1],
+            *logits.stride()[:-1],
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            DECODE_QUERY_LEN=decode_query_len,
+            BLOCK_N=_DECODE_BLOCK_N,
+            TILES_PER_PROG=tiles_per_program,
+            STAGES=2,
+            num_warps=2,
+        )
     _topk(
         logits,
         visible_blocks,

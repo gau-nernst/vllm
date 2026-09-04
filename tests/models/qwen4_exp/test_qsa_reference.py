@@ -676,6 +676,116 @@ def test_qsa_decode_selection_correctness(
 
 
 @requires_qsa_kernels
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(90),
+    reason="The CuteDSL QSA score kernel requires SM90+",
+)
+@pytest.mark.parametrize(
+    ("decode_query_len", "page_size", "num_requests"),
+    [
+        (1, 196, 2),
+        (4, 196, 33),
+        (1, 392, 3),
+        (4, 392, 33),
+    ],
+)
+def test_qsa_decode_selection_cutedsl(
+    decode_query_len: int, page_size: int, num_requests: int
+) -> None:
+    """CuteDSL decode score: live-column logits and dispatched top-k selection.
+
+    page_size 196 exercises the whole-page stage path; 392 exercises 128-row
+    subpages with a ragged 8-row tail. num_requests 33 reaches split_k=32.
+    """
+    cutedsl = qsa_indexer_ops._qsa_score_cutedsl_module()
+    if cutedsl is None:
+        pytest.skip("CuteDSL score module unavailable")
+
+    torch.manual_seed(7)
+    heads, head_dim, compress_ratio = 4, 128, 4
+    rows = num_requests * decode_query_len
+    q = torch.randn(rows, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    max_sequence_length = 2560
+    pages_per_request = -(-(max_sequence_length // compress_ratio) // page_size)
+    num_pages = num_requests * pages_per_request
+    cache = torch.randn(
+        num_pages,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        num_requests, pages_per_request
+    )
+    token_to_req = torch.repeat_interleave(
+        torch.arange(num_requests, device="cuda", dtype=torch.int32),
+        decode_query_len,
+    )
+    sequence_lengths = max_sequence_length - 4 * (
+        torch.arange(num_requests, device="cuda", dtype=torch.int32) % 8
+    )
+    query_positions = torch.cat(
+        [
+            torch.arange(
+                length - decode_query_len,
+                length,
+                device="cuda",
+                dtype=torch.int32,
+            )
+            for length in sequence_lengths.tolist()
+        ]
+    )
+    visible_blocks = torch.minimum(
+        (query_positions + 1) // compress_ratio,
+        sequence_lengths.index_select(0, token_to_req.long()) // compress_ratio,
+    )
+    assert cutedsl.qsa_score_cutedsl_supported(q, cache, page_table, decode_query_len)
+
+    columns = pages_per_request * page_size
+    logits = torch.empty((rows, columns), dtype=torch.float32, device="cuda")
+    cutedsl.qsa_paged_score_cutedsl(
+        q, cache, page_table, visible_blocks, logits, decode_query_len
+    )
+    reference_logits = _qsa_mqa_paged_reference(
+        q, cache, page_table, token_to_req, visible_blocks
+    )
+    live = torch.arange(columns, device="cuda").unsqueeze(0) < visible_blocks.unsqueeze(
+        1
+    )
+    torch.testing.assert_close(
+        logits[live], reference_logits[live], rtol=2e-3, atol=2e-3
+    )
+
+    token_topk = 2048
+    actual = torch.empty(
+        (rows, token_topk // compress_ratio), device="cuda", dtype=torch.int32
+    )
+    qsa_indexer_ops.qsa_select_paged_decode(
+        q,
+        cache,
+        page_table,
+        visible_blocks,
+        token_topk,
+        compress_ratio,
+        decode_query_len,
+        actual,
+    )
+    expected = _qsa_select_paged_reference(
+        q,
+        cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        token_topk,
+        compress_ratio,
+    )
+    torch.testing.assert_close(actual.sort().values, expected.sort().values)
+
+
+@requires_qsa_kernels
 @pytest.mark.parametrize("seq_len_slack", [0, 1792])
 @pytest.mark.parametrize("force_chunk", [False, True])
 def test_qsa_prefill_selection_correctness(
