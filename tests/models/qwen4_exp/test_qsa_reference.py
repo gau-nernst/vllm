@@ -982,8 +982,8 @@ def test_qsa_split_selection_correctness(workspace_init, decode_query_len: int) 
 
 @requires_qsa_kernels
 def test_qsa_selection_handles_no_complete_compressed_blocks(workspace_init) -> None:
-    q = torch.zeros(2, 4, 8, device="cuda", dtype=torch.bfloat16)
-    cache = torch.zeros(1, 16, 1, 8, device="cuda", dtype=torch.bfloat16)
+    q = torch.zeros(2, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.zeros(1, 16, 1, 128, device="cuda", dtype=torch.bfloat16)
     page_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
     query_positions = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
     visible_blocks = torch.zeros(2, device="cuda", dtype=torch.int32)

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton kernels for Qwen4Exp QSA index selection."""
 
+from typing import NamedTuple
+
 import torch
 
 import vllm.envs as envs
@@ -10,6 +12,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
@@ -107,34 +110,81 @@ def _qsa_mqa_paged_uniform_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["num_rows", "query_offset"])
-def _qsa_mqa_paged_prefill_kernel(
-    q_ptr,
+@triton.jit
+def _gather_k_kernel(
     k_cache_ptr,
     page_table_ptr,
+    k_ptr,
+    query_start_loc_ptr,
+    visible_blocks_ptr,
+    stride_cache_block,
+    stride_cache_token,
+    stride_table_req,
+    stride_k_req,
+    max_cols,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CP: tl.constexpr,
+) -> None:
+    """Copy each request's useful compressed K columns into packed kc."""
+    request = tl.program_id(0)
+    cols = tl.program_id(1) * CP + tl.arange(0, CP)
+    query_base = tl.load(query_start_loc_ptr)
+    # useful columns = visible blocks at the request's last query row
+    req_end = tl.load(query_start_loc_ptr + request + 1)
+    useful = tl.load(visible_blocks_ptr + req_end - query_base - 1)
+    live = cols < tl.minimum(max_cols, useful)
+    logical_page = cols // PAGE_SIZE
+    page_offset = cols % PAGE_SIZE
+    phys = tl.load(
+        page_table_ptr + request * stride_table_req + logical_page, mask=live, other=0
+    )
+    dims = tl.arange(0, HEAD_DIM)
+    vals = tl.load(
+        k_cache_ptr
+        + phys[:, None].to(tl.int64) * stride_cache_block
+        + page_offset[:, None] * stride_cache_token
+        + dims[None, :],
+        mask=live[:, None],
+        other=0.0,
+    )
+    tl.store(
+        k_ptr
+        + request.to(tl.int64) * stride_k_req
+        + cols[:, None].to(tl.int64) * HEAD_DIM
+        + dims[None, :],
+        vals,
+        mask=live[:, None],
+    )
+
+
+@triton.jit(
+    do_not_specialize=["num_rows", "query_offset", "num_k_cols", "num_logits_cols"]
+)
+def _qsa_mqa_prefill_kernel(
+    q_ptr,
+    k_ptr,
+    k_desc,
     query_start_loc_ptr,
     visible_blocks_ptr,
     logits_ptr,
     stride_q_row,
     stride_q_head,
-    stride_cache_block,
-    stride_cache_token,
-    stride_table_req,
+    stride_k_req,
     stride_logits_row,
     num_rows,
     query_offset,
-    page_table_width,
-    PAGE_SIZE: tl.constexpr,
+    num_k_cols,
+    num_logits_cols,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     TILE_R: tl.constexpr,
     BLOCK_N: tl.constexpr,
     K_TILES: tl.constexpr,
-    STAGES: tl.constexpr,
+    USE_TMA: tl.constexpr,
+    WS: tl.constexpr,
 ) -> None:
-    num_columns = page_table_width * PAGE_SIZE
     NUM_HEADS_PADDED: tl.constexpr = triton.next_power_of_2(NUM_HEADS)
-    # tl.dot requires a reduction dimension of at least 16.
     BLOCK_D: tl.constexpr = max(16, triton.next_power_of_2(HEAD_DIM))
     request = tl.program_id(0)
     query_base = tl.load(query_start_loc_ptr)
@@ -153,66 +203,73 @@ def _qsa_mqa_paged_prefill_kernel(
     absolute_rows = absolute_row_start + lanes
     rows = absolute_rows - query_offset
     valid_rows = absolute_rows < request_end
-    visible = tl.load(
-        visible_blocks_ptr + absolute_rows,
-        mask=valid_rows,
-        other=0,
-    )
+    visible = tl.load(visible_blocks_ptr + absolute_rows, mask=valid_rows, other=0)
     max_visible = tl.max(visible, axis=0)
     k_tile_start = tl.program_id(2) * K_TILES
     if k_tile_start * BLOCK_N >= max_visible:
         return
     k_tile_end = tl.minimum(k_tile_start + K_TILES, tl.cdiv(max_visible, BLOCK_N))
-    k_tile_end = tl.minimum(k_tile_end, tl.cdiv(num_columns, BLOCK_N))
+    k_tile_end = tl.minimum(k_tile_end, tl.cdiv(num_k_cols, BLOCK_N))
 
     dims = tl.arange(0, BLOCK_D)
     m = tl.arange(0, TILE_R * NUM_HEADS_PADDED)
     q_row_offsets = m // NUM_HEADS_PADDED
     q_rows = absolute_row_start + q_row_offsets
     heads = m % NUM_HEADS_PADDED
-    query = tl.load(
+
+    q_ptrs = (
         q_ptr
         + q_rows[None, :] * stride_q_row
         + heads[None, :] * stride_q_head
-        + dims[:, None],
-        mask=(heads[None, :] < NUM_HEADS)
-        & (absolute_row_start + q_row_offsets[None, :] < request_end)
-        & (dims[:, None] < HEAD_DIM),
-        other=0.0,
+        + dims[:, None]
     )
+    q_mask = (
+        (heads[None, :] < NUM_HEADS)
+        & (q_rows[None, :] < request_end)
+        & (dims[:, None] < HEAD_DIM)
+    )
+    query = tl.load(q_ptrs, q_mask, other=0.0)
+
     column_offsets = tl.arange(0, BLOCK_N)
-    for tile in tl.range(k_tile_start, k_tile_end, num_stages=STAGES):
+    k_row0 = request * (stride_k_req // HEAD_DIM)
+    if USE_TMA:
+        # Row bound = this request's end within the chunk, so TMA box
+        # clipping handles request/chunk-boundary straddles (no store mask).
+        store_desc = tl.make_tensor_descriptor(
+            logits_ptr,
+            [request_end - query_offset, num_logits_cols],
+            [stride_logits_row, 1],
+            [TILE_R, BLOCK_N],
+        )
+    for tile in tl.range(k_tile_start, k_tile_end, warp_specialize=WS):
         columns = tile * BLOCK_N + column_offsets
-        live = columns < max_visible
-        logical_page = tl.minimum(columns // PAGE_SIZE, page_table_width - 1)
-        page_offset = columns % PAGE_SIZE
-        physical_page = tl.load(
-            page_table_ptr + request * stride_table_req + logical_page,
-            mask=live,
-            other=0,
-        )
-        keys = tl.load(
-            k_cache_ptr
-            + physical_page[:, None].to(tl.int64) * stride_cache_block
-            + page_offset[:, None] * stride_cache_token
-            + dims[None, :],
-            mask=live[:, None] & (dims[None, :] < HEAD_DIM),
-            other=0.0,
-            eviction_policy="evict_first",
-        )
+        if USE_TMA:
+            keys = k_desc.load([k_row0 + tile * BLOCK_N, 0])
+        else:
+            k_ptrs = (
+                k_ptr
+                + (k_row0 + columns[:, None]).to(tl.int64) * HEAD_DIM
+                + dims[None, :]
+            )
+            mask = (columns[:, None] < max_visible) & (dims[None, :] < HEAD_DIM)
+            keys = tl.load(k_ptrs, mask, other=0.0, eviction_policy="evict_first")
         scores = tl.dot(keys, query, out_dtype=tl.float32)
         scores = tl.reshape(scores, (BLOCK_N, TILE_R, NUM_HEADS_PADDED))
         score = tl.sum(tl.maximum(scores, 0.0), axis=2)
-        store_mask = (
-            valid_rows[None, :]
-            & (columns[:, None] < visible[None, :])
-            & (columns[:, None] < num_columns)
-        )
-        tl.store(
-            logits_ptr + rows[None, :] * stride_logits_row + columns[:, None],
-            score,
-            mask=store_mask,
-        )
+        if USE_TMA:
+            store_desc.store(
+                [absolute_row_start - query_offset, tile * BLOCK_N], tl.trans(score)
+            )
+        else:
+            logits_ptrs = (
+                logits_ptr + rows[None, :] * stride_logits_row + columns[:, None]
+            )
+            store_mask = (
+                valid_rows[None, :]
+                & (columns[:, None] < visible[None, :])
+                & (columns[:, None] < num_k_cols)
+            )
+            tl.store(logits_ptrs, score, store_mask)
 
 
 @triton.jit
@@ -365,55 +422,154 @@ def warmup_qsa_mqa_paged_decode(
     return profiles
 
 
+def warmup_qsa_mqa_prefill(
+    k_cache: torch.Tensor, page_table: torch.Tensor, *, num_heads: int, head_dim: int
+) -> tuple[str, ...]:
+    """Compile every gathered-K prefill specialization without launching."""
+    page_size = k_cache.shape[1]
+    columns = 256  # >= TMA box dims; values are do_not_specialize
+    num_reqs, rows = 1, 64
+    q_ptr = TritonWarmupTensor(torch.bfloat16, shape=(rows, num_heads, head_dim))
+    kc_ptr = TritonWarmupTensor(k_cache.dtype, shape=(num_reqs, columns, head_dim))
+    logits_ptr = TritonWarmupTensor(torch.float32, shape=(rows, columns))
+    visible_blocks_ptr = TritonWarmupTensor(torch.int32)
+    query_start_loc_ptr = TritonWarmupTensor(torch.int32)
+
+    _gather_k_kernel.warmup(
+        k_cache,
+        page_table,
+        kc_ptr,
+        query_start_loc_ptr,
+        visible_blocks_ptr,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        page_table.stride(0),
+        columns * head_dim,
+        columns,
+        PAGE_SIZE=page_size,
+        HEAD_DIM=head_dim,
+        CP=64,
+        num_warps=8,
+        grid=(num_reqs, 1),
+    )
+
+    warmed = []
+    seen = set()
+    for num_reqs_probe in (1, 8):
+        config, use_tma = _prefill_plan(num_reqs_probe)
+        if (config, use_tma) in seen:
+            continue
+        seen.add((config, use_tma))
+        k_desc = None
+        if use_tma:
+            # Triton warmup needs a real (tiny) descriptor for the K-load
+            # arg, and its box shape must match the config's BLOCK_N
+            k_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+                torch.empty(
+                    columns, head_dim, dtype=k_cache.dtype, device=k_cache.device
+                ),
+                [config.BLOCK_N, head_dim],
+            )
+        _qsa_mqa_prefill_kernel.warmup(
+            q_ptr,
+            kc_ptr,
+            k_desc,
+            query_start_loc_ptr,
+            visible_blocks_ptr,
+            logits_ptr,
+            num_heads * head_dim,
+            head_dim,
+            columns * head_dim,
+            columns,
+            rows,
+            0,
+            columns,
+            columns,
+            NUM_HEADS=num_heads,
+            HEAD_DIM=head_dim,
+            USE_TMA=use_tma,
+            WS=use_tma,
+            grid=(num_reqs, 1, 1),
+            **config._asdict(),
+        )
+        warmed.append(config.BLOCK_N)
+    return ("gather", *[f"block_n={bn}" for bn in warmed])
+
+
+class _PrefillProfile(NamedTuple):
+    TILE_R: int
+    BLOCK_N: int
+    K_TILES: int
+    num_stages: int
+    num_warps: int
+
+
+def _prefill_plan(num_requests: int) -> tuple[_PrefillProfile, bool]:
+    use_tma = current_platform.has_device_capability(90)
+
+    # profile for pre-Hopper. 69.6 KB smem. untuned.
+    if not use_tma:
+        return _PrefillProfile(32, 64, 16, 2, 4), use_tma
+
+    # profile for consumer Blackwell. untuned.
+    if current_platform.is_device_capability_family(120):
+        return _PrefillProfile(32, 64, 16, 2, 4), use_tma
+
+    # profile for Hopper and Blackwell. tuned on GB300
+    if num_requests >= 8:
+        return _PrefillProfile(64, 128, 32, 2, 8), use_tma
+    return _PrefillProfile(64, 128, 64, 3, 8), use_tma
+
+
 def _prefill_logits(
     q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
+    k: torch.Tensor,
     query_start_loc: torch.Tensor,
     visible_blocks: torch.Tensor,
     max_query_len: int,
     logits_width: int,
     query_offset: int,
     num_queries: int,
+    config: _PrefillProfile,
+    use_tma: bool,
 ) -> torch.Tensor:
-    assert query_start_loc.shape == (page_table.shape[0] + 1,)
-    assert visible_blocks.shape == (q.shape[0],)
+    assert query_start_loc.shape == (k.shape[0] + 1,)
     assert 0 <= query_offset <= query_offset + num_queries <= q.shape[0]
-    assert 0 < logits_width <= page_table.shape[1] * k_cache.shape[1]
+    assert 0 < logits_width <= k.shape[1]
 
+    k_desc = None
+    if use_tma:
+        head_dim = k.shape[-1]
+        k_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+            k.view(-1, head_dim), [config.BLOCK_N, head_dim]
+        )
     logits = torch.empty(
         (num_queries, logits_width), dtype=torch.float32, device=q.device
     )
-    TILE_R = 64
-    BLOCK_N = 64
-    K_TILES = 16
     grid = (
-        page_table.shape[0],
-        triton.cdiv(min(num_queries, max_query_len), TILE_R),
-        triton.cdiv(logits_width, BLOCK_N * K_TILES),
+        k.shape[0],
+        triton.cdiv(min(num_queries, max_query_len), config.TILE_R),
+        triton.cdiv(logits_width, config.BLOCK_N * config.K_TILES),
     )
-    _qsa_mqa_paged_prefill_kernel[grid](
+    _qsa_mqa_prefill_kernel[grid](
         q,
-        k_cache,
-        page_table,
+        k,
+        k_desc,
         query_start_loc,
         visible_blocks,
         logits,
         *q.stride()[:-1],
-        *k_cache.stride()[:2],
-        *page_table.stride()[:-1],
+        k.stride(0),
         *logits.stride()[:-1],
         num_queries,
         query_offset,
-        page_table.shape[1],
-        PAGE_SIZE=k_cache.shape[1],
+        k.shape[1],
+        logits_width,
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
-        TILE_R=TILE_R,
-        BLOCK_N=BLOCK_N,
-        K_TILES=K_TILES,
-        STAGES=2,
-        num_warps=4,
+        USE_TMA=use_tma,
+        WS=use_tma,
+        **config._asdict(),
     )
     return logits
 
@@ -595,19 +751,42 @@ def qsa_select_paged_prefill(
         (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
     )
 
+    # gather K cache into a contiguous buffer
+    config, use_tma = _prefill_plan(page_table.shape[0])
+    if use_tma:
+        set_triton_allocator(q.device)
+    gathered_k = k_cache.new_empty(page_table.shape[0], logits_width, q.shape[2])
+    _gather_k_kernel[(page_table.shape[0], triton.cdiv(logits_width, 64))](
+        k_cache,
+        page_table,
+        gathered_k,
+        query_start_loc,
+        visible_blocks,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        page_table.stride(0),
+        gathered_k.stride(0),
+        logits_width,
+        PAGE_SIZE=k_cache.shape[1],
+        HEAD_DIM=q.shape[2],
+        CP=64,  # launch-bound floor; wider spills or idles SMs
+        num_warps=8,
+    )
+
     for query_start in range(0, rows, rows_per_chunk):
         query_end = min(query_start + rows_per_chunk, rows)
         query_slice = slice(query_start, query_end)
         logits = _prefill_logits(
             q,
-            k_cache,
-            page_table,
+            gathered_k,
             query_start_loc,
             visible_blocks,
             max_query_len,
             logits_width,
             query_offset=query_start,
             num_queries=query_end - query_start,
+            config=config,
+            use_tma=use_tma,
         )
         _topk(
             logits,
@@ -623,5 +802,6 @@ __all__ = [
     "expand_qsa_block_indices",
     "qsa_select_paged_decode",
     "qsa_select_paged_prefill",
+    "warmup_qsa_mqa_prefill",
     "warmup_qsa_mqa_paged_decode",
 ]

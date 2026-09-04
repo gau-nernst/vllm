@@ -50,10 +50,17 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
 
     from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
         warmup_qsa_mqa_paged_decode,
+        warmup_qsa_mqa_prefill,
     )
 
     k_cache = indexer.compressed_key_cache.kv_cache
     assert k_cache.numel()
+    prefill_profiles = warmup_qsa_mqa_prefill(
+        k_cache,
+        block_table,
+        num_heads=indexer.index_n_heads,
+        head_dim=indexer.index_head_dim,
+    )
     profiles = warmup_qsa_mqa_paged_decode(
         k_cache,
         block_table,
@@ -64,3 +71,4 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         max_num_batched_tokens=runner.max_num_tokens,
     )
     logger.info("Warmed up Qwen4Exp QSA decode kernels: %s.", profiles)
+    logger.info("Warmed up Qwen4Exp QSA prefill kernels: %s.", prefill_profiles)
