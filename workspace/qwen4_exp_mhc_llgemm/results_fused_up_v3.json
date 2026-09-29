@@ -1,0 +1,122 @@
+{
+  "meta": {
+    "gpu": "NVIDIA GB300",
+    "dtype": "bf16",
+    "commit": "d6cce94fd4221e6f5547e1c00ca5e0c92ab52d6c",
+    "torch": "2.13.0+cu130"
+  },
+  "rows": [
+    {
+      "M": 1,
+      "maxdiff_fp32ref": 0.003866910934448242,
+      "maxdiff_prodchain": 0.0,
+      "bit_identical": true,
+      "fused_v3_us": 4.64,
+      "gemm_cublas_us": 4.5120000000000005,
+      "chain_cublas_us": 6.144,
+      "chain_cublaslt_us": 6.176,
+      "best_unfused": "cublas",
+      "best_unfused_us": 6.144,
+      "speedup_vs_best": 1.324137931034483,
+      "gbps_fused": 1418.0689655172414
+    },
+    {
+      "M": 2,
+      "maxdiff_fp32ref": 0.003876924514770508,
+      "maxdiff_prodchain": 0.0,
+      "bit_identical": true,
+      "fused_v3_us": 4.64,
+      "gemm_cublas_us": 4.5120000000000005,
+      "chain_cublas_us": 6.24,
+      "chain_cublaslt_us": 6.208,
+      "best_unfused": "cublaslt",
+      "best_unfused_us": 6.208,
+      "speedup_vs_best": 1.3379310344827589,
+      "gbps_fused": 1423.7241379310346
+    },
+    {
+      "M": 4,
+      "maxdiff_fp32ref": 0.00390625,
+      "maxdiff_prodchain": 0.0078125,
+      "bit_identical": false,
+      "fused_v3_us": 4.672,
+      "gemm_cublas_us": 4.5440000000000005,
+      "chain_cublas_us": 6.303999999999999,
+      "chain_cublaslt_us": 6.464,
+      "best_unfused": "cublas",
+      "best_unfused_us": 6.303999999999999,
+      "speedup_vs_best": 1.3493150684931505,
+      "gbps_fused": 1425.205479452055
+    },
+    {
+      "M": 8,
+      "maxdiff_fp32ref": 0.00390625,
+      "maxdiff_prodchain": 0.0078125,
+      "bit_identical": false,
+      "fused_v3_us": 6.56,
+      "gemm_cublas_us": 4.4799999999999995,
+      "chain_cublas_us": 6.335999999999999,
+      "chain_cublaslt_us": 6.464,
+      "best_unfused": "cublas",
+      "best_unfused_us": 6.335999999999999,
+      "speedup_vs_best": 0.9658536585365853,
+      "gbps_fused": 1031.0243902439024
+    },
+    {
+      "M": 16,
+      "maxdiff_fp32ref": 0.00390625,
+      "maxdiff_prodchain": 0.0078125,
+      "bit_identical": false,
+      "fused_v3_us": 8.864,
+      "gemm_cublas_us": 4.832000000000001,
+      "chain_cublas_us": 6.848,
+      "chain_cublaslt_us": 6.752,
+      "best_unfused": "cublaslt",
+      "best_unfused_us": 6.752,
+      "speedup_vs_best": 0.7617328519855595,
+      "gbps_fused": 786.7148014440432
+    },
+    {
+      "M": 32,
+      "maxdiff_fp32ref": 0.00390625,
+      "maxdiff_prodchain": 0.0078125,
+      "bit_identical": false,
+      "fused_v3_us": 14.88,
+      "gemm_cublas_us": 4.896,
+      "chain_cublas_us": 7.008,
+      "chain_cublaslt_us": 7.168,
+      "best_unfused": "cublas",
+      "best_unfused_us": 7.008,
+      "speedup_vs_best": 0.47096774193548385,
+      "gbps_fused": 496.8602150537634
+    },
+    {
+      "M": 48,
+      "maxdiff_fp32ref": 0.00390625,
+      "maxdiff_prodchain": 0.0078125,
+      "bit_identical": false,
+      "fused_v3_us": 20.927999999999997,
+      "gemm_cublas_us": 4.672,
+      "chain_cublas_us": 8.704,
+      "chain_cublaslt_us": 8.736,
+      "best_unfused": "cublas",
+      "best_unfused_us": 8.704,
+      "speedup_vs_best": 0.41590214067278297,
+      "gbps_fused": 373.33333333333337
+    },
+    {
+      "M": 64,
+      "maxdiff_fp32ref": 0.00390625,
+      "maxdiff_prodchain": 0.0078125,
+      "bit_identical": false,
+      "fused_v3_us": 26.656,
+      "gemm_cublas_us": 4.736,
+      "chain_cublas_us": 8.895999999999999,
+      "chain_cublaslt_us": 9.056,
+      "best_unfused": "cublas",
+      "best_unfused_us": 8.895999999999999,
+      "speedup_vs_best": 0.3337334933973589,
+      "gbps_fused": 308.859543817527
+    }
+  ]
+}

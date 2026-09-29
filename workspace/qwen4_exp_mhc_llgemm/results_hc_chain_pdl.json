@@ -1,0 +1,1022 @@
+{
+  "meta": {
+    "gpu": "NVIDIA GB300",
+    "dtype": "bf16",
+    "commit": "d6cce94fd4221e6f5547e1c00ca5e0c92ab52d6c",
+    "torch": "2.13.0+cu130"
+  },
+  "rows": [
+    {
+      "M": 1,
+      "down_early_bitidentical": true,
+      "maxdiff_v3": 0.0,
+      "maxdiff_v5": 0.0009765625,
+      "maxdiff_v7": 0.0009765625,
+      "maxdiff_v7_nopdl": 0.0009765625,
+      "maxdiff_v7_waitfirst": 0.0009765625,
+      "prod": {
+        "0:down": {
+          "dur_us": 3.808,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 3.936,
+          "start_us": 3.776
+        },
+        "2:gate_mix": {
+          "dur_us": 4.032,
+          "start_us": 5.312
+        },
+        "_total_us": 9.344
+      },
+      "unfused_early": {
+        "0:down_early": {
+          "dur_us": 3.84,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.416,
+          "start_us": 3.04
+        },
+        "2:gate_mix": {
+          "dur_us": 3.968,
+          "start_us": 4.96
+        },
+        "_total_us": 8.96
+      },
+      "v5_early": {
+        "0:down_early": {
+          "dur_us": 3.84,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 4.992,
+          "start_us": 2.976
+        },
+        "_total_us": 7.904
+      },
+      "v7_early": {
+        "0:down_early": {
+          "dur_us": 3.84,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.704,
+          "start_us": 2.976
+        },
+        "_total_us": 7.648
+      },
+      "v7_nopdl": {
+        "0:down_early": {
+          "dur_us": 3.84,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.48,
+          "start_us": 4.32
+        },
+        "_total_us": 8.8
+      },
+      "v7_waitfirst": {
+        "0:down_early": {
+          "dur_us": 3.808,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 5.04,
+          "start_us": 2.928
+        },
+        "_total_us": 7.968
+      },
+      "v3_early": {
+        "0:down_early": {
+          "dur_us": 3.84,
+          "start_us": 0.0
+        },
+        "1:v3": {
+          "dur_us": 4.512,
+          "start_us": 2.976
+        },
+        "_total_us": 7.456
+      }
+    },
+    {
+      "M": 2,
+      "down_early_bitidentical": true,
+      "maxdiff_v3": 0.0,
+      "maxdiff_v5": 0.001953125,
+      "maxdiff_v7": 0.001953125,
+      "maxdiff_v7_nopdl": 0.001953125,
+      "maxdiff_v7_waitfirst": 0.001953125,
+      "prod": {
+        "0:down": {
+          "dur_us": 4.032,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 3.936,
+          "start_us": 4.128
+        },
+        "2:gate_mix": {
+          "dur_us": 2.944,
+          "start_us": 6.784
+        },
+        "_total_us": 9.696
+      },
+      "unfused_early": {
+        "0:down_early": {
+          "dur_us": 4.032,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.064,
+          "start_us": 3.328
+        },
+        "2:gate_mix": {
+          "dur_us": 2.816,
+          "start_us": 6.112
+        },
+        "_total_us": 8.896
+      },
+      "v5_early": {
+        "0:down_early": {
+          "dur_us": 4.032,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 4.8,
+          "start_us": 3.264
+        },
+        "_total_us": 8.032
+      },
+      "v7_early": {
+        "0:down_early": {
+          "dur_us": 4.032,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.48,
+          "start_us": 3.248
+        },
+        "_total_us": 7.712
+      },
+      "v7_nopdl": {
+        "0:down_early": {
+          "dur_us": 4.032,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.192,
+          "start_us": 4.48
+        },
+        "_total_us": 8.704
+      },
+      "v7_waitfirst": {
+        "0:down_early": {
+          "dur_us": 4.0,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.512,
+          "start_us": 3.232
+        },
+        "_total_us": 7.776
+      },
+      "v3_early": {
+        "0:down_early": {
+          "dur_us": 4.032,
+          "start_us": 0.0
+        },
+        "1:v3": {
+          "dur_us": 4.672,
+          "start_us": 3.232
+        },
+        "_total_us": 7.904
+      }
+    },
+    {
+      "M": 4,
+      "down_early_bitidentical": true,
+      "maxdiff_v3": 0.001953125,
+      "maxdiff_v5": 0.001953125,
+      "maxdiff_v7": 0.001953125,
+      "maxdiff_v7_nopdl": 0.001953125,
+      "maxdiff_v7_waitfirst": 0.001953125,
+      "prod": {
+        "0:down": {
+          "dur_us": 5.696,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 3.904,
+          "start_us": 5.632
+        },
+        "2:gate_mix": {
+          "dur_us": 3.2,
+          "start_us": 8.096
+        },
+        "_total_us": 11.296
+      },
+      "unfused_early": {
+        "0:down_early": {
+          "dur_us": 4.928,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.064,
+          "start_us": 4.0645
+        },
+        "2:gate_mix": {
+          "dur_us": 3.232,
+          "start_us": 6.624
+        },
+        "_total_us": 9.888
+      },
+      "v5_early": {
+        "0:down_early": {
+          "dur_us": 4.96,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 4.816,
+          "start_us": 4.0
+        },
+        "_total_us": 8.832
+      },
+      "v7_early": {
+        "0:down_early": {
+          "dur_us": 4.928,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.352,
+          "start_us": 4.0
+        },
+        "_total_us": 8.32
+      },
+      "v7_nopdl": {
+        "0:down_early": {
+          "dur_us": 4.928,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.224,
+          "start_us": 5.408
+        },
+        "_total_us": 9.632
+      },
+      "v7_waitfirst": {
+        "0:down_early": {
+          "dur_us": 4.928,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.864,
+          "start_us": 3.968
+        },
+        "_total_us": 8.8
+      },
+      "v3_early": {
+        "0:down_early": {
+          "dur_us": 4.96,
+          "start_us": 0.0
+        },
+        "1:v3": {
+          "dur_us": 4.48,
+          "start_us": 4.032
+        },
+        "_total_us": 8.512
+      }
+    },
+    {
+      "M": 8,
+      "down_early_bitidentical": true,
+      "maxdiff_v3": 0.001953125,
+      "maxdiff_v5": 0.001953125,
+      "maxdiff_v7": 0.001953125,
+      "maxdiff_v7_nopdl": 0.001953125,
+      "maxdiff_v7_waitfirst": 0.001953125,
+      "prod": {
+        "0:down": {
+          "dur_us": 5.024,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.0645,
+          "start_us": 5.184
+        },
+        "2:gate_mix": {
+          "dur_us": 3.168,
+          "start_us": 7.872
+        },
+        "_total_us": 11.04
+      },
+      "unfused_early": {
+        "0:down_early": {
+          "dur_us": 5.024,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.16,
+          "start_us": 4.224
+        },
+        "2:gate_mix": {
+          "dur_us": 3.04,
+          "start_us": 7.04
+        },
+        "_total_us": 10.112
+      },
+      "v5_early": {
+        "0:down_early": {
+          "dur_us": 5.024,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 7.712,
+          "start_us": 1.44
+        },
+        "_total_us": 9.184
+      },
+      "v7_early": {
+        "0:down_early": {
+          "dur_us": 5.92,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 7.104,
+          "start_us": 1.504
+        },
+        "_total_us": 8.672
+      },
+      "v7_nopdl": {
+        "0:down_early": {
+          "dur_us": 4.992,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.384,
+          "start_us": 5.472
+        },
+        "_total_us": 9.888
+      },
+      "v7_waitfirst": {
+        "0:down_early": {
+          "dur_us": 5.024,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 7.36,
+          "start_us": 1.76
+        },
+        "_total_us": 9.088
+      },
+      "v3_early": {
+        "0:down_early": {
+          "dur_us": 6.144,
+          "start_us": 0.0
+        },
+        "1:v3": {
+          "dur_us": 9.6,
+          "start_us": 1.472
+        },
+        "_total_us": 11.104
+      }
+    },
+    {
+      "M": 16,
+      "down_early_bitidentical": true,
+      "maxdiff_v5": 0.001953125,
+      "maxdiff_v7": 0.001953125,
+      "maxdiff_v7_nopdl": 0.001953125,
+      "maxdiff_v7_waitfirst": 0.001953125,
+      "prod": {
+        "0:down": {
+          "dur_us": 5.312,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.352,
+          "start_us": 5.472
+        },
+        "2:gate_mix": {
+          "dur_us": 3.52,
+          "start_us": 8.16
+        },
+        "_total_us": 11.68
+      },
+      "unfused_early": {
+        "0:down_early": {
+          "dur_us": 5.28,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.48,
+          "start_us": 4.608
+        },
+        "2:gate_mix": {
+          "dur_us": 3.488,
+          "start_us": 7.456
+        },
+        "_total_us": 10.944
+      },
+      "v5_early": {
+        "0:down_early": {
+          "dur_us": 5.312,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 8.128,
+          "start_us": 1.472
+        },
+        "_total_us": 9.632
+      },
+      "v7_early": {
+        "0:down_early": {
+          "dur_us": 5.856,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 8.0,
+          "start_us": 1.152
+        },
+        "_total_us": 9.184
+      },
+      "v7_nopdl": {
+        "0:down_early": {
+          "dur_us": 5.312,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.48,
+          "start_us": 5.792
+        },
+        "_total_us": 10.304
+      },
+      "v7_waitfirst": {
+        "0:down_early": {
+          "dur_us": 5.28,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 7.808,
+          "start_us": 1.472
+        },
+        "_total_us": 9.28
+      }
+    },
+    {
+      "M": 32,
+      "down_early_bitidentical": true,
+      "maxdiff_v5": 0.00390625,
+      "maxdiff_v7": 0.00390625,
+      "maxdiff_v7_nopdl": 0.00390625,
+      "maxdiff_v7_waitfirst": 0.00390625,
+      "prod": {
+        "0:down": {
+          "dur_us": 5.6,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.256,
+          "start_us": 5.472
+        },
+        "2:gate_mix": {
+          "dur_us": 4.672,
+          "start_us": 7.04
+        },
+        "_total_us": 11.712
+      },
+      "unfused_early": {
+        "0:down_early": {
+          "dur_us": 5.696,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.896,
+          "start_us": 4.672
+        },
+        "2:gate_mix": {
+          "dur_us": 4.864,
+          "start_us": 6.88
+        },
+        "_total_us": 11.744
+      },
+      "v5_early": {
+        "0:down_early": {
+          "dur_us": 5.632,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 8.736,
+          "start_us": 1.76
+        },
+        "_total_us": 10.464
+      },
+      "v7_early": {
+        "0:down_early": {
+          "dur_us": 5.632,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 8.16,
+          "start_us": 1.472
+        },
+        "_total_us": 9.664
+      },
+      "v7_nopdl": {
+        "0:down_early": {
+          "dur_us": 5.648,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 4.992,
+          "start_us": 6.24
+        },
+        "_total_us": 11.264
+      },
+      "v7_waitfirst": {
+        "0:down_early": {
+          "dur_us": 5.664,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 8.448,
+          "start_us": 1.568
+        },
+        "_total_us": 10.048
+      }
+    },
+    {
+      "M": 48,
+      "down_early_bitidentical": true,
+      "maxdiff_v5": 0.00390625,
+      "maxdiff_v7": 0.00390625,
+      "maxdiff_v7_nopdl": 0.00390625,
+      "maxdiff_v7_waitfirst": 0.00390625,
+      "prod": {
+        "0:down": {
+          "dur_us": 6.4,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.352,
+          "start_us": 6.272
+        },
+        "2:gate_mix": {
+          "dur_us": 5.984,
+          "start_us": 8.8165
+        },
+        "_total_us": 14.752
+      },
+      "unfused_early": {
+        "0:down_early": {
+          "dur_us": 6.4,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 5.28,
+          "start_us": 5.088
+        },
+        "2:gate_mix": {
+          "dur_us": 5.92,
+          "start_us": 8.576
+        },
+        "_total_us": 14.496
+      },
+      "v5_early": {
+        "0:down_early": {
+          "dur_us": 6.368,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 10.112,
+          "start_us": 2.112
+        },
+        "_total_us": 12.256
+      },
+      "v7_early": {
+        "0:down_early": {
+          "dur_us": 6.4,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 8.992,
+          "start_us": 1.824
+        },
+        "_total_us": 10.784
+      },
+      "v7_nopdl": {
+        "0:down_early": {
+          "dur_us": 6.336,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 5.632,
+          "start_us": 6.848
+        },
+        "_total_us": 12.512
+      },
+      "v7_waitfirst": {
+        "0:down_early": {
+          "dur_us": 6.368,
+          "start_us": 0.0
+        },
+        "1:v7": {
+          "dur_us": 9.856,
+          "start_us": 1.632
+        },
+        "_total_us": 11.4885
+      }
+    },
+    {
+      "M": 64,
+      "down_early_bitidentical": true,
+      "maxdiff_v5": 0.00390625,
+      "maxdiff_v7": 0.00390625,
+      "maxdiff_v7_nopdl": 0.00390625,
+      "maxdiff_v7_waitfirst": 0.00390625,
+      "prod": {
+        "0:cublas": {
+          "dur_us": 5.984,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.264,
+          "start_us": 4.976
+        },
+        "2:silu": {
+          "dur_us": 2.304,
+          "start_us": 7.136
+        },
+        "3:cublas": {
+          "dur_us": 4.064,
+          "start_us": 9.312
+        },
+        "4:gate_mix": {
+          "dur_us": 6.016,
+          "start_us": 11.584
+        },
+        "_total_us": 17.6
+      },
+      "unfused_early": {
+        "0:cublas": {
+          "dur_us": 6.016,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.328,
+          "start_us": 5.088
+        },
+        "2:silu": {
+          "dur_us": 2.368,
+          "start_us": 7.296
+        },
+        "3:cublas": {
+          "dur_us": 4.32,
+          "start_us": 9.28
+        },
+        "4:gate_mix": {
+          "dur_us": 5.824,
+          "start_us": 12.032
+        },
+        "_total_us": 17.856
+      },
+      "v5_early": {
+        "0:cublas": {
+          "dur_us": 5.952,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.296,
+          "start_us": 4.96
+        },
+        "2:silu": {
+          "dur_us": 2.304,
+          "start_us": 7.104
+        },
+        "3:v5": {
+          "dur_us": 6.688,
+          "start_us": 9.28
+        },
+        "_total_us": 15.968
+      },
+      "v7_early": {
+        "0:cublas": {
+          "dur_us": 5.984,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.264,
+          "start_us": 4.96
+        },
+        "2:silu": {
+          "dur_us": 2.304,
+          "start_us": 7.104
+        },
+        "3:v7": {
+          "dur_us": 5.504,
+          "start_us": 9.28
+        },
+        "_total_us": 14.816
+      },
+      "v7_nopdl": {
+        "0:cublas": {
+          "dur_us": 6.016,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.296,
+          "start_us": 5.12
+        },
+        "2:silu": {
+          "dur_us": 1.792,
+          "start_us": 7.84
+        },
+        "3:v7": {
+          "dur_us": 5.568,
+          "start_us": 9.92
+        },
+        "_total_us": 15.488
+      },
+      "v7_waitfirst": {
+        "0:cublas": {
+          "dur_us": 6.016,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.376,
+          "start_us": 5.088
+        },
+        "2:silu": {
+          "dur_us": 2.4,
+          "start_us": 7.296
+        },
+        "3:v7": {
+          "dur_us": 5.856,
+          "start_us": 9.28
+        },
+        "_total_us": 15.136
+      }
+    },
+    {
+      "M": 96,
+      "down_early_bitidentical": true,
+      "maxdiff_v5": 0.00390625,
+      "maxdiff_v7": 0.00390625,
+      "maxdiff_v7_nopdl": 0.00390625,
+      "maxdiff_v7_waitfirst": 0.00390625,
+      "prod": {
+        "0:cublas": {
+          "dur_us": 8.416,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.232,
+          "start_us": 7.392
+        },
+        "2:silu": {
+          "dur_us": 2.272,
+          "start_us": 9.536
+        },
+        "3:cublas": {
+          "dur_us": 4.608,
+          "start_us": 11.616
+        },
+        "4:gate_mix": {
+          "dur_us": 6.4,
+          "start_us": 14.144
+        },
+        "_total_us": 20.512
+      },
+      "unfused_early": {
+        "0:cublas": {
+          "dur_us": 8.352,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.232,
+          "start_us": 7.488
+        },
+        "2:silu": {
+          "dur_us": 2.4,
+          "start_us": 9.6485
+        },
+        "3:cublas": {
+          "dur_us": 4.608,
+          "start_us": 11.632
+        },
+        "4:gate_mix": {
+          "dur_us": 6.336,
+          "start_us": 14.208
+        },
+        "_total_us": 20.544
+      },
+      "v5_early": {
+        "0:cublas": {
+          "dur_us": 8.416,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.232,
+          "start_us": 7.424
+        },
+        "2:silu": {
+          "dur_us": 2.272,
+          "start_us": 9.568
+        },
+        "3:v5": {
+          "dur_us": 5.728,
+          "start_us": 11.6
+        },
+        "_total_us": 17.312
+      },
+      "v7_early": {
+        "0:cublas": {
+          "dur_us": 8.32,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.2,
+          "start_us": 7.488
+        },
+        "2:silu": {
+          "dur_us": 2.272,
+          "start_us": 9.6
+        },
+        "3:v7": {
+          "dur_us": 6.56,
+          "start_us": 11.52
+        },
+        "_total_us": 18.08
+      },
+      "v7_nopdl": {
+        "0:cublas": {
+          "dur_us": 8.32,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.072,
+          "start_us": 7.456
+        },
+        "2:silu": {
+          "dur_us": 1.728,
+          "start_us": 10.112
+        },
+        "3:v7": {
+          "dur_us": 6.208,
+          "start_us": 12.128
+        },
+        "_total_us": 18.304
+      },
+      "v7_waitfirst": {
+        "0:cublas": {
+          "dur_us": 8.416,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.296,
+          "start_us": 7.392
+        },
+        "2:silu": {
+          "dur_us": 2.4,
+          "start_us": 9.696
+        },
+        "3:v7": {
+          "dur_us": 6.56,
+          "start_us": 11.632
+        },
+        "_total_us": 18.24
+      }
+    },
+    {
+      "M": 128,
+      "down_early_bitidentical": true,
+      "maxdiff_v5": 0.00390625,
+      "maxdiff_v7": 0.00390625,
+      "maxdiff_v7_nopdl": 0.00390625,
+      "maxdiff_v7_waitfirst": 0.00390625,
+      "prod": {
+        "0:cublas": {
+          "dur_us": 7.264,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.168,
+          "start_us": 6.528
+        },
+        "2:silu": {
+          "dur_us": 2.4,
+          "start_us": 8.576
+        },
+        "3:cublas": {
+          "dur_us": 4.64,
+          "start_us": 10.56
+        },
+        "4:gate_mix": {
+          "dur_us": 6.4,
+          "start_us": 13.184
+        },
+        "_total_us": 19.552
+      },
+      "unfused_early": {
+        "0:cublas": {
+          "dur_us": 7.296,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.2,
+          "start_us": 6.56
+        },
+        "2:silu": {
+          "dur_us": 2.4,
+          "start_us": 8.576
+        },
+        "3:cublas": {
+          "dur_us": 4.672,
+          "start_us": 10.592
+        },
+        "4:gate_mix": {
+          "dur_us": 6.528,
+          "start_us": 13.088
+        },
+        "_total_us": 19.584
+      },
+      "v5_early": {
+        "0:cublas": {
+          "dur_us": 7.264,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.168,
+          "start_us": 6.528
+        },
+        "2:silu": {
+          "dur_us": 2.304,
+          "start_us": 8.576
+        },
+        "3:v5": {
+          "dur_us": 6.848,
+          "start_us": 10.528
+        },
+        "_total_us": 17.408
+      },
+      "v7_early": {
+        "0:cublas": {
+          "dur_us": 7.392,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.344,
+          "start_us": 6.368
+        },
+        "2:silu": {
+          "dur_us": 2.304,
+          "start_us": 8.672
+        },
+        "3:v7": {
+          "dur_us": 6.976,
+          "start_us": 10.784
+        },
+        "_total_us": 17.792
+      },
+      "v7_nopdl": {
+        "0:cublas": {
+          "dur_us": 7.392,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.28,
+          "start_us": 6.368
+        },
+        "2:silu": {
+          "dur_us": 1.792,
+          "start_us": 9.056
+        },
+        "3:v7": {
+          "dur_us": 6.816,
+          "start_us": 11.232
+        },
+        "_total_us": 18.08
+      },
+      "v7_waitfirst": {
+        "0:cublas": {
+          "dur_us": 7.232,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.168,
+          "start_us": 6.48
+        },
+        "2:silu": {
+          "dur_us": 2.272,
+          "start_us": 8.544
+        },
+        "3:v7": {
+          "dur_us": 7.296,
+          "start_us": 10.464
+        },
+        "_total_us": 17.792
+      }
+    }
+  ]
+}

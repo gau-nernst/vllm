@@ -1,0 +1,818 @@
+{
+  "meta": {
+    "gpu": "NVIDIA GB300",
+    "commit": "d6cce94fd4221e6f5547e1c00ca5e0c92ab52d6c"
+  },
+  "rows": [
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 40,
+      "total_mb": 3.125,
+      "warm": false,
+      "dur_us": 3.17,
+      "gbs": 1034.3
+    },
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 80,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 3.94,
+      "gbs": 1665.0
+    },
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 107,
+      "total_mb": 8.359375,
+      "warm": false,
+      "dur_us": 4.38,
+      "gbs": 1999.4
+    },
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 128,
+      "total_mb": 10.0,
+      "warm": false,
+      "dur_us": 4.7,
+      "gbs": 2229.1
+    },
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": false,
+      "dur_us": 4.9,
+      "gbs": 2476.3
+    },
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 160,
+      "total_mb": 12.5,
+      "warm": false,
+      "dur_us": 5.06,
+      "gbs": 2592.4
+    },
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 222,
+      "total_mb": 17.34375,
+      "warm": false,
+      "dur_us": 6.05,
+      "gbs": 3007.0
+    },
+    {
+      "cfg": "tma s5xb16k",
+      "per_cta_kb": 80,
+      "g": 296,
+      "total_mb": 23.125,
+      "warm": false,
+      "dur_us": 7.04,
+      "gbs": 3444.4
+    },
+    {
+      "cfg": "tma s5b16k WARM",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": true,
+      "dur_us": 2.18,
+      "gbs": 5571.8
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 40,
+      "total_mb": 3.125,
+      "warm": false,
+      "dur_us": 3.26,
+      "gbs": 1003.9
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 80,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 3.97,
+      "gbs": 1651.6
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 107,
+      "total_mb": 8.359375,
+      "warm": false,
+      "dur_us": 4.45,
+      "gbs": 1970.6
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 128,
+      "total_mb": 10.0,
+      "warm": false,
+      "dur_us": 4.77,
+      "gbs": 2199.2
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": false,
+      "dur_us": 4.93,
+      "gbs": 2460.3
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 160,
+      "total_mb": 12.5,
+      "warm": false,
+      "dur_us": 5.09,
+      "gbs": 2576.1
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 222,
+      "total_mb": 17.34375,
+      "warm": false,
+      "dur_us": 6.14,
+      "gbs": 2960.0
+    },
+    {
+      "cfg": "tma s10xb8k",
+      "per_cta_kb": 80,
+      "g": 296,
+      "total_mb": 23.125,
+      "warm": false,
+      "dur_us": 7.07,
+      "gbs": 3428.8
+    },
+    {
+      "cfg": "tma s10b8k WARM",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": true,
+      "dur_us": 2.21,
+      "gbs": 5491.0
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 40,
+      "total_mb": 1.5625,
+      "warm": false,
+      "dur_us": 2.69,
+      "gbs": 609.5
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 80,
+      "total_mb": 3.125,
+      "warm": false,
+      "dur_us": 3.1,
+      "gbs": 1055.7
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 107,
+      "total_mb": 4.1796875,
+      "warm": false,
+      "dur_us": 3.36,
+      "gbs": 1304.4
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 128,
+      "total_mb": 5.0,
+      "warm": false,
+      "dur_us": 3.62,
+      "gbs": 1449.9
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 148,
+      "total_mb": 5.78125,
+      "warm": false,
+      "dur_us": 3.78,
+      "gbs": 1605.2
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 160,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 3.97,
+      "gbs": 1651.6
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 222,
+      "total_mb": 8.671875,
+      "warm": false,
+      "dur_us": 4.45,
+      "gbs": 2044.3
+    },
+    {
+      "cfg": "tma s5xb8k",
+      "per_cta_kb": 40,
+      "g": 296,
+      "total_mb": 11.5625,
+      "warm": false,
+      "dur_us": 4.96,
+      "gbs": 2444.4
+    },
+    {
+      "cfg": "tma s5b8k WARM",
+      "per_cta_kb": 40,
+      "g": 148,
+      "total_mb": 5.78125,
+      "warm": true,
+      "dur_us": 1.86,
+      "gbs": 3266.2
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 40,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 4.0,
+      "gbs": 1638.4
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 80,
+      "total_mb": 12.5,
+      "warm": false,
+      "dur_us": 5.06,
+      "gbs": 2592.4
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 107,
+      "total_mb": 16.71875,
+      "warm": false,
+      "dur_us": 5.95,
+      "gbs": 2945.4
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 128,
+      "total_mb": 20.0,
+      "warm": false,
+      "dur_us": 6.53,
+      "gbs": 3212.5
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 148,
+      "total_mb": 23.125,
+      "warm": false,
+      "dur_us": 6.96,
+      "gbs": 3483.7
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 160,
+      "total_mb": 25.0,
+      "warm": false,
+      "dur_us": 8.19,
+      "gbs": 3200.0
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 222,
+      "total_mb": 34.6875,
+      "warm": false,
+      "dur_us": 9.92,
+      "gbs": 3666.6
+    },
+    {
+      "cfg": "tma s10xb16k",
+      "per_cta_kb": 160,
+      "g": 296,
+      "total_mb": 46.25,
+      "warm": false,
+      "dur_us": 12.19,
+      "gbs": 3977.7
+    },
+    {
+      "cfg": "tma s10b16k WARM",
+      "per_cta_kb": 160,
+      "g": 148,
+      "total_mb": 23.125,
+      "warm": true,
+      "dur_us": 2.78,
+      "gbs": 8709.9
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 40,
+      "total_mb": 1.25,
+      "warm": false,
+      "dur_us": 2.46,
+      "gbs": 531.9
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 80,
+      "total_mb": 2.5,
+      "warm": false,
+      "dur_us": 2.82,
+      "gbs": 930.9
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 107,
+      "total_mb": 3.34375,
+      "warm": false,
+      "dur_us": 3.1,
+      "gbs": 1129.6
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 128,
+      "total_mb": 4.0,
+      "warm": false,
+      "dur_us": 3.3,
+      "gbs": 1272.5
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 148,
+      "total_mb": 4.625,
+      "warm": false,
+      "dur_us": 3.46,
+      "gbs": 1403.3
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 160,
+      "total_mb": 5.0,
+      "warm": false,
+      "dur_us": 3.55,
+      "gbs": 1476.0
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 222,
+      "total_mb": 6.9375,
+      "warm": false,
+      "dur_us": 3.97,
+      "gbs": 1833.3
+    },
+    {
+      "cfg": "tma s2xb16k",
+      "per_cta_kb": 32,
+      "g": 296,
+      "total_mb": 9.25,
+      "warm": false,
+      "dur_us": 4.51,
+      "gbs": 2149.7
+    },
+    {
+      "cfg": "tma s2b16k WARM",
+      "per_cta_kb": 32,
+      "g": 148,
+      "total_mb": 4.625,
+      "warm": true,
+      "dur_us": 1.73,
+      "gbs": 2806.5
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 40,
+      "total_mb": 3.125,
+      "warm": false,
+      "dur_us": 3.6,
+      "gbs": 910.1
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 80,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 4.26,
+      "gbs": 1539.8
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 107,
+      "total_mb": 8.359375,
+      "warm": false,
+      "dur_us": 4.77,
+      "gbs": 1838.4
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 128,
+      "total_mb": 10.0,
+      "warm": false,
+      "dur_us": 4.99,
+      "gbs": 2100.5
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": false,
+      "dur_us": 5.12,
+      "gbs": 2368.0
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 160,
+      "total_mb": 12.5,
+      "warm": false,
+      "dur_us": 5.28,
+      "gbs": 2482.4
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 222,
+      "total_mb": 17.34375,
+      "warm": false,
+      "dur_us": 6.34,
+      "gbs": 2870.3
+    },
+    {
+      "cfg": "tma s20xb4k",
+      "per_cta_kb": 80,
+      "g": 296,
+      "total_mb": 23.125,
+      "warm": false,
+      "dur_us": 7.2,
+      "gbs": 3367.8
+    },
+    {
+      "cfg": "tma s20b4k WARM",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": true,
+      "dur_us": 2.5,
+      "gbs": 4857.4
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 40,
+      "total_mb": 3.125,
+      "warm": false,
+      "dur_us": 4.83,
+      "gbs": 678.1
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 80,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 5.38,
+      "gbs": 1219.0
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 107,
+      "total_mb": 8.359375,
+      "warm": false,
+      "dur_us": 5.73,
+      "gbs": 1530.3
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 128,
+      "total_mb": 10.0,
+      "warm": false,
+      "dur_us": 5.97,
+      "gbs": 1757.0
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": false,
+      "dur_us": 6.21,
+      "gbs": 1953.0
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 160,
+      "total_mb": 12.5,
+      "warm": false,
+      "dur_us": 6.24,
+      "gbs": 2100.5
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 222,
+      "total_mb": 17.34375,
+      "warm": false,
+      "dur_us": 6.91,
+      "gbs": 2631.1
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 80,
+      "g": 296,
+      "total_mb": 23.125,
+      "warm": false,
+      "dur_us": 7.65,
+      "gbs": 3170.5
+    },
+    {
+      "cfg": "ldg u8 WARM",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": true,
+      "dur_us": 2.59,
+      "gbs": 4677.5
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 40,
+      "total_mb": 3.125,
+      "warm": false,
+      "dur_us": 4.16,
+      "gbs": 787.7
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 80,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 4.64,
+      "gbs": 1412.4
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 107,
+      "total_mb": 8.359375,
+      "warm": false,
+      "dur_us": 4.99,
+      "gbs": 1755.9
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 128,
+      "total_mb": 10.0,
+      "warm": false,
+      "dur_us": 5.18,
+      "gbs": 2022.7
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": false,
+      "dur_us": 5.38,
+      "gbs": 2255.2
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 160,
+      "total_mb": 12.5,
+      "warm": false,
+      "dur_us": 5.44,
+      "gbs": 2409.4
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 222,
+      "total_mb": 17.34375,
+      "warm": false,
+      "dur_us": 5.98,
+      "gbs": 3039.1
+    },
+    {
+      "cfg": "ldg u16",
+      "per_cta_kb": 80,
+      "g": 296,
+      "total_mb": 23.125,
+      "warm": false,
+      "dur_us": 6.59,
+      "gbs": 3678.4
+    },
+    {
+      "cfg": "ldg u16 WARM",
+      "per_cta_kb": 80,
+      "g": 148,
+      "total_mb": 11.5625,
+      "warm": true,
+      "dur_us": 2.3,
+      "gbs": 5262.2
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 40,
+      "total_mb": 1.5625,
+      "warm": false,
+      "dur_us": 3.04,
+      "gbs": 538.9
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 80,
+      "total_mb": 3.125,
+      "warm": false,
+      "dur_us": 3.33,
+      "gbs": 984.6
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 107,
+      "total_mb": 4.1796875,
+      "warm": false,
+      "dur_us": 3.52,
+      "gbs": 1245.1
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 128,
+      "total_mb": 5.0,
+      "warm": false,
+      "dur_us": 3.74,
+      "gbs": 1400.3
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 148,
+      "total_mb": 5.78125,
+      "warm": false,
+      "dur_us": 3.9,
+      "gbs": 1552.8
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 160,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 4.0,
+      "gbs": 1638.4
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 222,
+      "total_mb": 8.671875,
+      "warm": false,
+      "dur_us": 4.45,
+      "gbs": 2044.3
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 40,
+      "g": 296,
+      "total_mb": 11.5625,
+      "warm": false,
+      "dur_us": 4.86,
+      "gbs": 2492.6
+    },
+    {
+      "cfg": "ldg u8 WARM",
+      "per_cta_kb": 40,
+      "g": 148,
+      "total_mb": 5.78125,
+      "warm": true,
+      "dur_us": 1.82,
+      "gbs": 3323.5
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 40,
+      "total_mb": 6.25,
+      "warm": false,
+      "dur_us": 7.9,
+      "gbs": 829.1
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 80,
+      "total_mb": 12.5,
+      "warm": false,
+      "dur_us": 8.51,
+      "gbs": 1539.8
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 107,
+      "total_mb": 16.71875,
+      "warm": false,
+      "dur_us": 8.8,
+      "gbs": 1992.1
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 128,
+      "total_mb": 20.0,
+      "warm": false,
+      "dur_us": 9.22,
+      "gbs": 2275.6
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 148,
+      "total_mb": 23.125,
+      "warm": false,
+      "dur_us": 9.6,
+      "gbs": 2525.9
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 160,
+      "total_mb": 25.0,
+      "warm": false,
+      "dur_us": 9.76,
+      "gbs": 2685.9
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 222,
+      "total_mb": 34.6875,
+      "warm": false,
+      "dur_us": 11.23,
+      "gbs": 3238.3
+    },
+    {
+      "cfg": "ldg u8",
+      "per_cta_kb": 160,
+      "g": 296,
+      "total_mb": 46.25,
+      "warm": false,
+      "dur_us": 13.15,
+      "gbs": 3687.4
+    },
+    {
+      "cfg": "ldg u8 WARM",
+      "per_cta_kb": 160,
+      "g": 148,
+      "total_mb": 23.125,
+      "warm": true,
+      "dur_us": 3.71,
+      "gbs": 6532.4
+    }
+  ]
+}

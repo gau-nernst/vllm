@@ -1,0 +1,108 @@
+# A/B: fused mHC down+SiLU (qwen4exp-hc-down-silu) vs main.
+# Decode-focused: concurrency 1/4/16 sit inside the fused M<=48 window,
+# 64 exercises the unfused fallback (expect parity).
+# Adapted from ~/inferact-skills/vigil/configs/qwen38next/qwen_air_speed_8k1k.yaml.
+model: Qwen/Qwen3.8-Flash-Next
+mode: remote
+precheck: true
+collect_env: true
+mqa_repo_path: /home/${USER}/mqa
+
+pre_serve:
+  - cmd:
+      cmd: curl -sf http://localhost:9400/metrics
+      remote: true
+
+sweep:
+  branch:
+    - main
+    - qwen4exp-hc-down-silu
+  parallel_size: 1
+  fail_fast: false
+
+serving:
+  roles:
+    - role: worker
+      count: 1
+      nodes_per_instance: 1
+      gpus_per_node: 4
+      base_port: 8000
+      vllm_engine:
+        cmd: |
+          vllm serve {model}
+          --port {port}
+          --numa-bind
+          -tp 4
+          --no-enable-prefix-caching
+          --no-enable-flashinfer-autotune
+          --enable-auto-tool-choice
+          --tool-call-parser qwen3_coder
+          --reasoning-parser qwen3
+        repo_path: /home/${USER}/vllm/{branch}
+        env:
+          TMPDIR: /tmp/${USER}
+          HF_HUB_OFFLINE: "1"
+          VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+          VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+          VLLM_USE_RUST_FRONTEND: "1"
+          VLLM_USE_V2_MODEL_RUNNER: "1"
+          VLLM_ALLREDUCE_USE_FLASHINFER: "1"
+          FLASHINFER_WORKSPACE_BASE: /home/${USER}/vllm/{branch}
+        health_check:
+          url: http://localhost:{port}/health
+          timeout_s: 3600
+          poll_interval_s: 5
+        stop_timeout_s: 120
+
+  remote:
+    launcher: slurm
+    slurm:
+      partition: rack4
+      time_limit: "10:00:00"
+      gpus_per_node: 4
+      # nodelist pin removed: pod4-gb300-4-tray18-f3 has a sticky XID 43 on
+      # GPU0 (killed both variants on 2026-09-27); let Slurm pick a free node.
+
+post_serve:
+  - vmon:
+      action: start
+      delay: 5
+      interval: 1s
+      gpu_port: 9400
+
+  - cmd:
+      env:
+        VLLM_USE_RUST_BENCH: "1"
+      # repo_path prepends <repo>/.venv/bin to PATH in the hook; without it the
+      # remote post-serve shell (~/vigil/.venv) has no vllm binary.
+      repo_path: /home/${USER}/vllm/{branch}
+      cmd: >-
+        vllm bench serve
+        --backend openai-chat
+        --base-url http://{remote_host}:8000
+        --model {model}
+        --dataset-name speed-bench
+        --speed-bench-config throughput_8k
+        --speed-bench-max-input-len 8192
+        --speed-bench-output-len 1024
+        --ignore-eos
+        --num-warmups 5
+        --sweep-max-concurrency 1,4,16,64
+        --sweep-num-prompts-factor 10
+        --percentile-metrics "ttft,tpot,itl,e2el"
+        --metric-percentiles 50,90,99
+        --result-dir "{log_dir}/results"
+        --save-result
+
+  - vmon:
+      action: stop
+      delay: 5
+
+  - push:
+      mode: perf
+      path: "{log_dir}/results"
+      repo_path: "{mqa_repo_path}"
+      metrics_file: true
+      gpu_count: 4
+      dev: true
+      note: "({branch}) 8k1k TP4 hc-down-silu A/B"

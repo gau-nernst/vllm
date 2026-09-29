@@ -1,0 +1,293 @@
+{
+  "meta": {
+    "gpu": "NVIDIA GB300",
+    "dtype": "bf16",
+    "commit": "d6cce94fd4221e6f5547e1c00ca5e0c92ab52d6c",
+    "torch": "2.13.0+cu130"
+  },
+  "rows": [
+    {
+      "M": 1,
+      "cn_early_bitidentical": true,
+      "cnprod": {
+        "0:cn": {
+          "dur_us": 2.848,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 3.84,
+          "start_us": 2.144
+        },
+        "2:v3": {
+          "dur_us": 4.832,
+          "start_us": 4.608
+        },
+        "_total_us": 9.472
+      },
+      "cnearly": {
+        "0:cn_early": {
+          "dur_us": 3.68,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 5.088,
+          "start_us": 1.056
+        },
+        "2:v3": {
+          "dur_us": 4.832,
+          "start_us": 4.704
+        },
+        "_total_us": 9.536
+      },
+      "cnearly_pf": {
+        "0:cn_early": {
+          "dur_us": 3.648,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 4.912,
+          "start_us": 1.056
+        },
+        "2:v3": {
+          "dur_us": 4.8,
+          "start_us": 4.672
+        },
+        "_total_us": 9.472
+      }
+    },
+    {
+      "M": 2,
+      "cn_early_bitidentical": true,
+      "cnprod": {
+        "0:cn": {
+          "dur_us": 2.784,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 4.48,
+          "start_us": 2.272
+        },
+        "2:v3": {
+          "dur_us": 4.96,
+          "start_us": 5.216
+        },
+        "_total_us": 10.176
+      },
+      "cnearly": {
+        "0:cn_early": {
+          "dur_us": 2.72,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 5.472,
+          "start_us": 1.056
+        },
+        "2:v3": {
+          "dur_us": 4.832,
+          "start_us": 5.184
+        },
+        "_total_us": 10.016
+      },
+      "cnearly_pf": {
+        "0:cn_early": {
+          "dur_us": 3.616,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 5.088,
+          "start_us": 1.056
+        },
+        "2:v3": {
+          "dur_us": 4.768,
+          "start_us": 4.896
+        },
+        "_total_us": 9.696
+      }
+    },
+    {
+      "M": 4,
+      "cn_early_bitidentical": true,
+      "cnprod": {
+        "0:cn": {
+          "dur_us": 2.8,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 4.928,
+          "start_us": 2.272
+        },
+        "2:v3": {
+          "dur_us": 4.736,
+          "start_us": 5.824
+        },
+        "_total_us": 10.592
+      },
+      "cnearly": {
+        "0:cn_early": {
+          "dur_us": 2.752,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 6.24,
+          "start_us": 1.056
+        },
+        "2:v3": {
+          "dur_us": 4.864,
+          "start_us": 5.792
+        },
+        "_total_us": 10.656
+      },
+      "cnearly_pf": {
+        "0:cn_early": {
+          "dur_us": 3.968,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 6.192,
+          "start_us": 1.056
+        },
+        "2:v3": {
+          "dur_us": 4.704,
+          "start_us": 5.92
+        },
+        "_total_us": 10.656
+      }
+    },
+    {
+      "M": 8,
+      "cn_early_bitidentical": true,
+      "cnprod": {
+        "0:cn": {
+          "dur_us": 2.848,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 5.92,
+          "start_us": 2.368
+        },
+        "2:v7": {
+          "dur_us": 7.776,
+          "start_us": 3.36
+        },
+        "_total_us": 11.1525
+      },
+      "cnearly": {
+        "0:cn_early": {
+          "dur_us": 3.008,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 7.3285,
+          "start_us": 1.088
+        },
+        "2:v7": {
+          "dur_us": 9.184,
+          "start_us": 2.08
+        },
+        "_total_us": 11.264
+      }
+    },
+    {
+      "M": 16,
+      "cn_early_bitidentical": true,
+      "cnprod": {
+        "0:cn": {
+          "dur_us": 2.848,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 5.984,
+          "start_us": 2.4
+        },
+        "2:v7": {
+          "dur_us": 8.272,
+          "start_us": 3.456
+        },
+        "_total_us": 11.712
+      },
+      "cnearly": {
+        "0:cn_early": {
+          "dur_us": 2.944,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 7.264,
+          "start_us": 1.088
+        },
+        "2:v7": {
+          "dur_us": 9.536,
+          "start_us": 2.144
+        },
+        "_total_us": 11.712
+      }
+    },
+    {
+      "M": 32,
+      "cn_early_bitidentical": true,
+      "cnprod": {
+        "0:cn": {
+          "dur_us": 2.88,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 5.568,
+          "start_us": 2.592
+        },
+        "2:v7": {
+          "dur_us": 8.416,
+          "start_us": 3.68
+        },
+        "_total_us": 12.128
+      },
+      "cnearly": {
+        "0:cn_early": {
+          "dur_us": 2.912,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 5.696,
+          "start_us": 2.304
+        },
+        "2:v7": {
+          "dur_us": 8.352,
+          "start_us": 3.52
+        },
+        "_total_us": 11.904
+      }
+    },
+    {
+      "M": 48,
+      "cn_early_bitidentical": true,
+      "cnprod": {
+        "0:cn": {
+          "dur_us": 3.04,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 6.336,
+          "start_us": 2.784
+        },
+        "2:v7": {
+          "dur_us": 9.536,
+          "start_us": 3.904
+        },
+        "_total_us": 13.44
+      },
+      "cnearly": {
+        "0:cn_early": {
+          "dur_us": 3.04,
+          "start_us": 0.0
+        },
+        "1:down": {
+          "dur_us": 6.56,
+          "start_us": 2.4
+        },
+        "2:v7": {
+          "dur_us": 9.568,
+          "start_us": 3.68
+        },
+        "_total_us": 13.2645
+      }
+    }
+  ]
+}

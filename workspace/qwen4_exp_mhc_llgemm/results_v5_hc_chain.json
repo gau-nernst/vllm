@@ -1,0 +1,553 @@
+{
+  "meta": {
+    "gpu": "NVIDIA GB300",
+    "dtype": "bf16",
+    "commit": "d6cce94fd4221e6f5547e1c00ca5e0c92ab52d6c",
+    "torch": "2.13.0+cu130"
+  },
+  "rows": [
+    {
+      "M": 1,
+      "maxdiff_prodchain": 0.0009765625,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 5.632,
+          "start_us": 0.0
+        },
+        "_total_us": 5.632
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 5.632,
+          "start_us": 0.0
+        },
+        "_total_us": 5.632
+      },
+      "chainA_pdl": {
+        "0:down": {
+          "dur_us": 3.84,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.28,
+          "start_us": 3.8405
+        },
+        "_total_us": 9.152
+      },
+      "chainA_nopdl": {
+        "0:down": {
+          "dur_us": 3.872,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.024,
+          "start_us": 4.32
+        },
+        "_total_us": 9.344
+      },
+      "chainB": {
+        "0:down": {
+          "dur_us": 3.84,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.256,
+          "start_us": 4.0
+        },
+        "2:gate_mix": {
+          "dur_us": 3.072,
+          "start_us": 6.752
+        },
+        "_total_us": 9.824
+      }
+    },
+    {
+      "M": 2,
+      "maxdiff_prodchain": 0.001953125,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 5.6,
+          "start_us": 0.0
+        },
+        "_total_us": 5.6
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 5.6,
+          "start_us": 0.0
+        },
+        "_total_us": 5.6
+      },
+      "chainA_pdl": {
+        "0:down": {
+          "dur_us": 3.968,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.376,
+          "start_us": 3.872
+        },
+        "_total_us": 9.248
+      },
+      "chainA_nopdl": {
+        "0:down": {
+          "dur_us": 4.0,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.28,
+          "start_us": 4.608
+        },
+        "_total_us": 9.888
+      },
+      "chainB": {
+        "0:down": {
+          "dur_us": 4.0,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.128,
+          "start_us": 3.872
+        },
+        "2:gate_mix": {
+          "dur_us": 3.168,
+          "start_us": 6.576
+        },
+        "_total_us": 9.728
+      }
+    },
+    {
+      "M": 4,
+      "maxdiff_prodchain": 0.001953125,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 5.504,
+          "start_us": 0.0
+        },
+        "_total_us": 5.504
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 5.504,
+          "start_us": 0.0
+        },
+        "_total_us": 5.504
+      },
+      "chainA_pdl": {
+        "0:down": {
+          "dur_us": 5.504,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.472,
+          "start_us": 5.376
+        },
+        "_total_us": 10.848
+      },
+      "chainA_nopdl": {
+        "0:down": {
+          "dur_us": 5.52,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.088,
+          "start_us": 6.016
+        },
+        "_total_us": 11.072
+      },
+      "chainB": {
+        "0:down": {
+          "dur_us": 5.536,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.256,
+          "start_us": 5.408
+        },
+        "2:gate_mix": {
+          "dur_us": 3.232,
+          "start_us": 8.224
+        },
+        "_total_us": 11.456
+      }
+    },
+    {
+      "M": 8,
+      "maxdiff_prodchain": 0.001953125,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 5.6,
+          "start_us": 0.0
+        },
+        "_total_us": 5.6
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 5.6,
+          "start_us": 0.0
+        },
+        "_total_us": 5.6
+      },
+      "chainA_pdl": {
+        "0:down": {
+          "dur_us": 4.96,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.792,
+          "start_us": 5.088
+        },
+        "_total_us": 10.88
+      },
+      "chainA_nopdl": {
+        "0:down": {
+          "dur_us": 4.992,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.536,
+          "start_us": 5.6
+        },
+        "_total_us": 11.152
+      },
+      "chainB": {
+        "0:down": {
+          "dur_us": 4.96,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.288,
+          "start_us": 4.96
+        },
+        "2:gate_mix": {
+          "dur_us": 3.296,
+          "start_us": 7.744
+        },
+        "_total_us": 11.008
+      }
+    },
+    {
+      "M": 16,
+      "maxdiff_prodchain": 0.001953125,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 5.888,
+          "start_us": 0.0
+        },
+        "_total_us": 5.888
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 5.888,
+          "start_us": 0.0
+        },
+        "_total_us": 5.888
+      },
+      "chainA_pdl": {
+        "0:down": {
+          "dur_us": 5.152,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.696,
+          "start_us": 5.152
+        },
+        "_total_us": 10.8485
+      },
+      "chainA_nopdl": {
+        "0:down": {
+          "dur_us": 5.152,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.472,
+          "start_us": 5.632
+        },
+        "_total_us": 11.104
+      },
+      "chainB": {
+        "0:down": {
+          "dur_us": 5.152,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.64,
+          "start_us": 5.152
+        },
+        "2:gate_mix": {
+          "dur_us": 3.84,
+          "start_us": 7.84
+        },
+        "_total_us": 11.68
+      }
+    },
+    {
+      "M": 32,
+      "maxdiff_prodchain": 0.00390625,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 6.144,
+          "start_us": 0.0
+        },
+        "_total_us": 6.144
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 6.208,
+          "start_us": 0.0
+        },
+        "_total_us": 6.208
+      },
+      "chainA_pdl": {
+        "0:down": {
+          "dur_us": 5.76,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 6.048,
+          "start_us": 5.792
+        },
+        "_total_us": 11.872
+      },
+      "chainA_nopdl": {
+        "0:down": {
+          "dur_us": 5.792,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 5.6,
+          "start_us": 6.24
+        },
+        "_total_us": 11.888
+      },
+      "chainB": {
+        "0:down": {
+          "dur_us": 5.792,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.352,
+          "start_us": 5.632
+        },
+        "2:gate_mix": {
+          "dur_us": 4.016,
+          "start_us": 8.192
+        },
+        "_total_us": 12.16
+      }
+    },
+    {
+      "M": 48,
+      "maxdiff_prodchain": 0.00390625,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 7.232,
+          "start_us": 0.0
+        },
+        "_total_us": 7.232
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 7.328,
+          "start_us": 0.0
+        },
+        "_total_us": 7.328
+      },
+      "chainA_pdl": {
+        "0:down": {
+          "dur_us": 6.496,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 7.136,
+          "start_us": 6.464
+        },
+        "_total_us": 13.6
+      },
+      "chainA_nopdl": {
+        "0:down": {
+          "dur_us": 6.496,
+          "start_us": 0.0
+        },
+        "1:v5": {
+          "dur_us": 6.88,
+          "start_us": 7.104
+        },
+        "_total_us": 13.984
+      },
+      "chainB": {
+        "0:down": {
+          "dur_us": 6.528,
+          "start_us": 0.0
+        },
+        "1:cublas": {
+          "dur_us": 4.064,
+          "start_us": 6.336
+        },
+        "2:gate_mix": {
+          "dur_us": 6.08,
+          "start_us": 8.688
+        },
+        "_total_us": 14.752
+      }
+    },
+    {
+      "M": 64,
+      "maxdiff_prodchain": 0.00390625,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 7.424,
+          "start_us": 0.0
+        },
+        "_total_us": 7.424
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 7.488,
+          "start_us": 0.0
+        },
+        "_total_us": 7.488
+      },
+      "chainA_pdl": {
+        "0:cublas": {
+          "dur_us": 5.952,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.328,
+          "start_us": 4.928
+        },
+        "2:silu": {
+          "dur_us": 2.368,
+          "start_us": 7.104
+        },
+        "3:v5": {
+          "dur_us": 6.624,
+          "start_us": 9.28
+        },
+        "_total_us": 15.936
+      },
+      "chainA_nopdl": {
+        "0:cublas": {
+          "dur_us": 6.016,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.296,
+          "start_us": 5.056
+        },
+        "2:silu": {
+          "dur_us": 1.728,
+          "start_us": 7.68
+        },
+        "3:v5": {
+          "dur_us": 6.496,
+          "start_us": 9.792
+        },
+        "_total_us": 16.288
+      },
+      "chainB": {
+        "0:cublas": {
+          "dur_us": 5.952,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.328,
+          "start_us": 4.928
+        },
+        "2:silu": {
+          "dur_us": 2.336,
+          "start_us": 7.104
+        },
+        "3:cublas": {
+          "dur_us": 4.0165,
+          "start_us": 9.312
+        },
+        "4:gate_mix": {
+          "dur_us": 5.728,
+          "start_us": 11.872
+        },
+        "_total_us": 17.6
+      }
+    },
+    {
+      "M": 96,
+      "maxdiff_prodchain": 0.00390625,
+      "standalone_nopdl": {
+        "0:v5": {
+          "dur_us": 6.656,
+          "start_us": 0.0
+        },
+        "_total_us": 6.656
+      },
+      "standalone_strided": {
+        "0:v5": {
+          "dur_us": 6.656,
+          "start_us": 0.0
+        },
+        "_total_us": 6.656
+      },
+      "chainA_pdl": {
+        "0:cublas": {
+          "dur_us": 8.192,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.328,
+          "start_us": 7.296
+        },
+        "2:silu": {
+          "dur_us": 2.272,
+          "start_us": 9.344
+        },
+        "3:v5": {
+          "dur_us": 5.76,
+          "start_us": 11.456
+        },
+        "_total_us": 17.248
+      },
+      "chainA_nopdl": {
+        "0:cublas": {
+          "dur_us": 8.256,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.456,
+          "start_us": 7.392
+        },
+        "2:silu": {
+          "dur_us": 1.792,
+          "start_us": 9.92
+        },
+        "3:v5": {
+          "dur_us": 5.504,
+          "start_us": 12.064
+        },
+        "_total_us": 17.632
+      },
+      "chainB": {
+        "0:cublas": {
+          "dur_us": 8.256,
+          "start_us": 0.0
+        },
+        "1:splitk_reduce": {
+          "dur_us": 3.264,
+          "start_us": 7.36
+        },
+        "2:silu": {
+          "dur_us": 2.24,
+          "start_us": 9.408
+        },
+        "3:cublas": {
+          "dur_us": 4.448,
+          "start_us": 11.52
+        },
+        "4:gate_mix": {
+          "dur_us": 6.16,
+          "start_us": 14.144
+        },
+        "_total_us": 20.288
+      }
+    }
+  ]
+}
