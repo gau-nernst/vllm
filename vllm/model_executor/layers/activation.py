@@ -76,7 +76,7 @@ def _sigmoid_gate_mul_kernel(
     x_ptr,
     x_stride,
     g_ptr,
-    d,
+    d: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     launch_pdl: tl.constexpr,
 ) -> None:
@@ -105,6 +105,10 @@ def sigmoid_gate_mul_triton(
     def grid(meta):
         return (num_tokens, triton.cdiv(d, meta["BLOCK_SIZE"]))
 
+    # PDL regresses large grids (prelaunched blocks spinning in gdc_wait
+    # starve the predecessor); crossover measured at ~224 tokens on GB300.
+    launch_pdl = current_platform.is_arch_support_pdl() and num_tokens <= 128
+
     _sigmoid_gate_mul_kernel[grid](
         output,
         output.stride(0),
@@ -113,7 +117,7 @@ def sigmoid_gate_mul_triton(
         gate,
         d=d,
         BLOCK_SIZE=1024,
-        launch_pdl=current_platform.is_arch_support_pdl(),
+        launch_pdl=launch_pdl,
     )
 
 
