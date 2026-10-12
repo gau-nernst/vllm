@@ -116,8 +116,9 @@ def sigmoid_gate_mul_triton(
         input.stride(0),
         gate,
         d=d,
-        BLOCK_SIZE=1024,
+        BLOCK_SIZE=4096,
         launch_pdl=launch_pdl,
+        num_warps=8,
     )
 
 
