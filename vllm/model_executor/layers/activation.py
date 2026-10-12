@@ -78,17 +78,22 @@ def _sigmoid_gate_mul_kernel(
     g_ptr,
     d,
     BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ) -> None:
     i = tl.program_id(axis=0).to(tl.int64)
     j = tl.program_id(axis=1)
-    g = tl.load(g_ptr + i).to(tl.float32)
-    s = tl.sigmoid(g)
     o_row_ptr = o_ptr + o_stride * i
     x_row_ptr = x_ptr + x_stride * i
     offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < d
-    x = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
-    tl.store(o_row_ptr + offsets, (x * s).to(o_ptr.dtype.element_ty), mask=mask)
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+    g = tl.load(g_ptr + i)
+    x = tl.load(x_row_ptr + offsets, mask=mask)
+    s = tl.sigmoid(g.to(tl.float32))
+    tl.store(o_row_ptr + offsets, x.to(tl.float32) * s, mask=mask)
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def sigmoid_gate_mul_triton(
@@ -108,6 +113,7 @@ def sigmoid_gate_mul_triton(
         gate,
         d=d,
         BLOCK_SIZE=1024,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
 
 
