@@ -51,6 +51,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -118,6 +119,13 @@ class Qwen3MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
         self.gate_mul = SigmoidGateMul() if expert_gate is not None else None
+        # The fused gate GEMV requires the unquantized, bias-free
+        # ReplicatedLinear; anything else falls back to the unfused path.
+        self.fuse_expert_gate = (
+            expert_gate is not None
+            and isinstance(expert_gate.quant_method, UnquantizedLinearMethod)
+            and expert_gate.bias is None
+        )
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -126,7 +134,10 @@ class Qwen3MoeMLP(nn.Module):
 
         if self.expert_gate is not None:
             assert self.gate_mul is not None
-            out = self.gate_mul(out, self.expert_gate(x)[0])
+            if self.fuse_expert_gate:
+                out = self.gate_mul(out, x, self.expert_gate.weight)
+            else:
+                out = self.gate_mul(out, self.expert_gate(x)[0])
 
         return out
 

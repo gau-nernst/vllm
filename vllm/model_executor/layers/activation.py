@@ -118,6 +118,67 @@ def sigmoid_gate_mul_triton(
     )
 
 
+@triton.jit
+def _gemv_gate_mul_kernel(
+    o_ptr,
+    o_stride,
+    z_ptr,
+    z_stride,
+    x_ptr,
+    x_stride,
+    w_ptr,
+    d: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr,
+) -> None:
+    i = tl.program_id(axis=0).to(tl.int64)
+    x_row_ptr = x_ptr + x_stride * i
+    z_row_ptr = z_ptr + z_stride * i
+    o_row_ptr = o_ptr + o_stride * i
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for j in tl.static_range(0, d, BLOCK_SIZE):
+        offsets = j + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < d
+        x = tl.load(x_row_ptr + offsets, mask=mask)
+        w = tl.load(w_ptr + offsets, mask=mask)
+        acc += x.to(tl.float32) * w.to(tl.float32)
+    s = tl.sigmoid(tl.sum(acc))
+    for j in tl.static_range(0, d, BLOCK_SIZE):
+        offsets = j + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < d
+        z = tl.load(z_row_ptr + offsets, mask=mask)
+        tl.store(o_row_ptr + offsets, z.to(tl.float32) * s, mask=mask)
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def gemv_gate_mul_triton(
+    output: torch.Tensor,
+    z: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+):
+    num_tokens, d = z.shape
+    assert x.shape == z.shape
+    assert weight.numel() == d
+
+    _gemv_gate_mul_kernel[(num_tokens,)](
+        output,
+        output.stride(0),
+        z,
+        z.stride(0),
+        x,
+        x.stride(0),
+        weight,
+        d=d,
+        BLOCK_SIZE=4096,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+        num_warps=8,
+    )
+
+
 # --8<-- [start:fatrelu_and_mul]
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
@@ -605,22 +666,45 @@ class SigmoidGateMul(CustomOp):
     """Per-token sigmoid gating, used by gated shared experts.
 
     Computes (x, gate) -> sigmoid(gate) * x where gate holds one logit per
-    token, broadcast over the hidden dimension.
+    token, broadcast over the hidden dimension. When gate_weight is given,
+    gate_input is instead the per-token hidden state and the gate logits are
+    computed in-kernel as a fused GEMV: sigmoid(gate_input @ gate_weight) * x.
 
     Shapes:
         x: (num_tokens, d)
-        gate: (num_tokens, 1) or (num_tokens,)
+        gate_input: (num_tokens, 1) or (num_tokens,) precomputed logits, or
+            (num_tokens, d) hidden states when gate_weight is given
+        gate_weight: (1, d) or (d,) optional gate projection weight
         return: (num_tokens, d)
     """
 
-    def forward_native(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        gate_input: torch.Tensor,
+        gate_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
+        gate = gate_input if gate_weight is None else F.linear(gate_input, gate_weight)
         return F.sigmoid(gate) * x
 
-    def forward_cuda(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        gate_input: torch.Tensor,
+        gate_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = x.reshape(-1, x.shape[-1])
         out = torch.empty_like(x, memory_format=torch.contiguous_format)
-        sigmoid_gate_mul_triton(out, x, gate.reshape(-1))
+        if gate_weight is None:
+            sigmoid_gate_mul_triton(out, x, gate_input.reshape(-1))
+        else:
+            gemv_gate_mul_triton(
+                out,
+                x,
+                gate_input.reshape(-1, gate_input.shape[-1]),
+                gate_weight.reshape(-1),
+            )
         return out
 
 
