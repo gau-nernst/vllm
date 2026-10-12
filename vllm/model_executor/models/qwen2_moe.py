@@ -31,13 +31,15 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import Qwen2MoeConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SigmoidGateMul, SiluAndMul
+from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -58,7 +60,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.triton_utils import tl, triton
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (
@@ -71,6 +75,163 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _sigmoid_gate_mul_kernel(
+    o_ptr,
+    o_stride,
+    x_ptr,
+    x_stride,
+    g_ptr,
+    d: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr,
+) -> None:
+    i = tl.program_id(axis=0).to(tl.int64)
+    j = tl.program_id(axis=1)
+    o_row_ptr = o_ptr + o_stride * i
+    x_row_ptr = x_ptr + x_stride * i
+    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < d
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+    g = tl.load(g_ptr + i)
+    x = tl.load(x_row_ptr + offsets, mask=mask)
+    s = tl.sigmoid(g.to(tl.float32))
+    tl.store(o_row_ptr + offsets, x.to(tl.float32) * s, mask=mask)
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def sigmoid_gate_mul_triton(
+    output: torch.Tensor, input: torch.Tensor, gate: torch.Tensor
+):
+    num_tokens, d = input.shape
+    assert gate.numel() == num_tokens
+
+    def grid(meta):
+        return (num_tokens, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    _sigmoid_gate_mul_kernel[grid](
+        output,
+        output.stride(0),
+        input,
+        input.stride(0),
+        gate,
+        d=d,
+        BLOCK_SIZE=4096,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+        num_warps=8,
+    )
+
+
+@triton.jit
+def _gemv_gate_mul_kernel(
+    o_ptr,
+    o_stride,
+    z_ptr,
+    z_stride,
+    x_ptr,
+    x_stride,
+    w_ptr,
+    d: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    launch_pdl: tl.constexpr,
+) -> None:
+    i = tl.program_id(axis=0).to(tl.int64)
+    x_row_ptr = x_ptr + x_stride * i
+    z_row_ptr = z_ptr + z_stride * i
+    o_row_ptr = o_ptr + o_stride * i
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for j in tl.static_range(0, d, BLOCK_SIZE):
+        offsets = j + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < d
+        x = tl.load(x_row_ptr + offsets, mask=mask)
+        w = tl.load(w_ptr + offsets, mask=mask)
+        acc += x.to(tl.float32) * w.to(tl.float32)
+    s = tl.sigmoid(tl.sum(acc))
+    for j in tl.static_range(0, d, BLOCK_SIZE):
+        offsets = j + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < d
+        z = tl.load(z_row_ptr + offsets, mask=mask)
+        tl.store(o_row_ptr + offsets, z.to(tl.float32) * s, mask=mask)
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def gemv_gate_mul_triton(
+    output: torch.Tensor,
+    z: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+):
+    num_tokens, d = z.shape
+    assert x.shape == z.shape
+    assert weight.numel() == d
+
+    _gemv_gate_mul_kernel[(num_tokens,)](
+        output,
+        output.stride(0),
+        z,
+        z.stride(0),
+        x,
+        x.stride(0),
+        weight,
+        d=d,
+        BLOCK_SIZE=4096,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+        num_warps=8,
+    )
+
+
+@CustomOp.register("sigmoid_gate_mul")
+class SigmoidGateMul(CustomOp):
+    """Per-token sigmoid gating, used by gated shared experts.
+
+    Computes (x, gate) -> sigmoid(gate) * x where gate holds one logit per
+    token, broadcast over the hidden dimension. When gate_weight is given,
+    gate_input is instead the per-token hidden state and the gate logits are
+    computed in-kernel as a fused GEMV: sigmoid(gate_input @ gate_weight) * x.
+
+    Shapes:
+        x: (num_tokens, d)
+        gate_input: (num_tokens, 1) or (num_tokens,) precomputed logits, or
+            (num_tokens, d) hidden states when gate_weight is given
+        gate_weight: (1, d) or (d,) optional gate projection weight
+        return: (num_tokens, d)
+    """
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        gate_input: torch.Tensor,
+        gate_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        gate = gate_input if gate_weight is None else F.linear(gate_input, gate_weight)
+        return F.sigmoid(gate) * x
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        gate_input: torch.Tensor,
+        gate_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x.reshape(-1, x.shape[-1])
+        out = torch.empty_like(x, memory_format=torch.contiguous_format)
+        if gate_weight is None:
+            sigmoid_gate_mul_triton(out, x, gate_input.reshape(-1))
+        else:
+            gemv_gate_mul_triton(
+                out,
+                x,
+                gate_input.reshape(-1, gate_input.shape[-1]),
+                gate_weight.reshape(-1),
+            )
+        return out
 
 
 class Qwen2MoeMLP(nn.Module):

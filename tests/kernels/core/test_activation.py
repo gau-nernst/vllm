@@ -17,7 +17,6 @@ from vllm.model_executor.layers.activation import (
     NewGELU,
     QuickGELU,
     ReLUSquaredActivation,
-    SigmoidGateMul,
     SiluAndMul,
     SiluAndMulWithClamp,
     SwigluOAIAndMul,
@@ -30,6 +29,7 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
 )
 from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
+from vllm.model_executor.models.qwen2_moe import SigmoidGateMul
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 

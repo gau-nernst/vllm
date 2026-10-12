@@ -39,7 +39,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SigmoidGateMul, SiluAndMul
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -72,6 +72,7 @@ from .interfaces import (
     SupportsPP,
     SupportsQuant,
 )
+from .qwen2_moe import SigmoidGateMul
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
