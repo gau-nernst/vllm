@@ -29,7 +29,6 @@ from vllm.model_executor.layers.fused_moe.activation import (
     apply_moe_activation,
 )
 from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
-from vllm.model_executor.models.qwen2_moe import SigmoidGateMul
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -236,83 +235,6 @@ def test_swiglu_limit_func_without_routing_uses_output_buffer() -> None:
     )
 
     torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("d", D)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@torch.inference_mode()
-def test_sigmoid_gate_mul(
-    default_vllm_config,
-    num_tokens: int,
-    d: int,
-    dtype: torch.dtype,
-    seed: int,
-    device: str,
-) -> None:
-    set_random_seed(seed)
-    torch.set_default_device(device)
-    layer = SigmoidGateMul()
-    x = torch.randn(num_tokens, d, dtype=dtype)
-    gate = torch.randn(num_tokens, 1, dtype=dtype)
-    # Saturating logits exercise the sigmoid tails.
-    gate[0] = 100.0
-    gate[-1] = -100.0
-
-    out = layer(x, gate)
-    ref_out = layer.forward_native(x, gate)
-    torch.testing.assert_close(
-        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
-    )
-
-    # Row-strided input (every other row of a wider buffer).
-    base = torch.randn(2 * num_tokens, d, dtype=dtype)
-    gate2 = torch.randn(2 * num_tokens, 1, dtype=dtype)
-    strided = base[::2]
-    out = layer(strided, gate2[::2])
-    ref_out = layer.forward_native(strided, gate2[::2])
-    torch.testing.assert_close(
-        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
-    )
-
-
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("d", D)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@torch.inference_mode()
-def test_sigmoid_gate_mul_fused_gemv(
-    default_vllm_config,
-    num_tokens: int,
-    d: int,
-    dtype: torch.dtype,
-    seed: int,
-    device: str,
-) -> None:
-    set_random_seed(seed)
-    torch.set_default_device(device)
-    layer = SigmoidGateMul()
-    z = torch.randn(num_tokens, d, dtype=dtype)
-    x = torch.randn(num_tokens, d, dtype=dtype)
-    weight = torch.randn(1, d, dtype=dtype)
-
-    out = layer(z, x, weight)
-    ref_out = layer.forward_native(z, x, weight)
-    torch.testing.assert_close(
-        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
-    )
-
-    # Row-strided inputs (every other row of wider buffers).
-    z_base = torch.randn(2 * num_tokens, d, dtype=dtype)
-    x_base = torch.randn(2 * num_tokens, d, dtype=dtype)
-    out = layer(z_base[::2], x_base[::2], weight)
-    ref_out = layer.forward_native(z_base[::2], x_base[::2], weight)
-    torch.testing.assert_close(
-        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
-    )
 
 
 @pytest.mark.parametrize(

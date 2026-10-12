@@ -119,13 +119,14 @@ class Qwen3MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
-        self.gate_mul = SigmoidGateMul() if expert_gate is not None else None
         # The fused gate GEMV requires the unquantized, bias-free
-        # ReplicatedLinear; anything else falls back to the unfused path.
-        self.fuse_expert_gate = (
-            expert_gate is not None
+        # ReplicatedLinear; anything else runs the gate eagerly.
+        self.gate_mul = (
+            SigmoidGateMul()
+            if expert_gate is not None
             and isinstance(expert_gate.quant_method, UnquantizedLinearMethod)
             and expert_gate.bias is None
+            else None
         )
 
     def forward(self, x):
@@ -134,11 +135,10 @@ class Qwen3MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            assert self.gate_mul is not None
-            if self.fuse_expert_gate:
+            if self.gate_mul is not None:
                 out = self.gate_mul(out, x, self.expert_gate.weight)
             else:
-                out = self.gate_mul(out, self.expert_gate(x)[0])
+                out = torch.sigmoid(self.expert_gate(x)[0]) * out
 
         return out
 

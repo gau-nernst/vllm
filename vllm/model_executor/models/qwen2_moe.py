@@ -31,7 +31,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 from transformers import Qwen2MoeConfig
 
 from vllm.compilation.decorators import support_torch_compile
@@ -78,55 +77,6 @@ logger = init_logger(__name__)
 
 
 @triton.jit
-def _sigmoid_gate_mul_kernel(
-    o_ptr,
-    o_stride,
-    x_ptr,
-    x_stride,
-    g_ptr,
-    d: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    launch_pdl: tl.constexpr,
-) -> None:
-    i = tl.program_id(axis=0).to(tl.int64)
-    j = tl.program_id(axis=1)
-    o_row_ptr = o_ptr + o_stride * i
-    x_row_ptr = x_ptr + x_stride * i
-    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < d
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-    g = tl.load(g_ptr + i)
-    x = tl.load(x_row_ptr + offsets, mask=mask)
-    s = tl.sigmoid(g.to(tl.float32))
-    tl.store(o_row_ptr + offsets, x.to(tl.float32) * s, mask=mask)
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-def sigmoid_gate_mul_triton(
-    output: torch.Tensor, input: torch.Tensor, gate: torch.Tensor
-):
-    num_tokens, d = input.shape
-    assert gate.numel() == num_tokens
-
-    def grid(meta):
-        return (num_tokens, triton.cdiv(d, meta["BLOCK_SIZE"]))
-
-    _sigmoid_gate_mul_kernel[grid](
-        output,
-        output.stride(0),
-        input,
-        input.stride(0),
-        gate,
-        d=d,
-        BLOCK_SIZE=4096,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-        num_warps=8,
-    )
-
-
-@triton.jit
 def _gemv_gate_mul_kernel(
     o_ptr,
     o_stride,
@@ -162,45 +112,19 @@ def _gemv_gate_mul_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def gemv_gate_mul_triton(
-    output: torch.Tensor,
-    z: torch.Tensor,
-    x: torch.Tensor,
-    weight: torch.Tensor,
-):
-    num_tokens, d = z.shape
-    assert x.shape == z.shape
-    assert weight.numel() == d
-
-    _gemv_gate_mul_kernel[(num_tokens,)](
-        output,
-        output.stride(0),
-        z,
-        z.stride(0),
-        x,
-        x.stride(0),
-        weight,
-        d=d,
-        BLOCK_SIZE=4096,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-        num_warps=8,
-    )
-
-
 @CustomOp.register("sigmoid_gate_mul")
 class SigmoidGateMul(CustomOp):
-    """Per-token sigmoid gating, used by gated shared experts.
+    """Per-token sigmoid gating for gated shared experts, with the gate
+    projection (a per-token scalar GEMV) fused in.
 
-    Computes (x, gate) -> sigmoid(gate) * x where gate holds one logit per
-    token, broadcast over the hidden dimension. When gate_weight is given,
-    gate_input is instead the per-token hidden state and the gate logits are
-    computed in-kernel as a fused GEMV: sigmoid(gate_input @ gate_weight) * x.
+    Computes (x, gate_input, gate_weight) -> sigmoid(gate_input @ gate_weight) * x
+    where the gate logit is one scalar per token, broadcast over the hidden
+    dimension.
 
     Shapes:
         x: (num_tokens, d)
-        gate_input: (num_tokens, 1) or (num_tokens,) precomputed logits, or
-            (num_tokens, d) hidden states when gate_weight is given
-        gate_weight: (1, d) or (d,) optional gate projection weight
+        gate_input: (num_tokens, d)
+        gate_weight: (1, d) or (d,)
         return: (num_tokens, d)
     """
 
@@ -208,29 +132,37 @@ class SigmoidGateMul(CustomOp):
         self,
         x: torch.Tensor,
         gate_input: torch.Tensor,
-        gate_weight: torch.Tensor | None = None,
+        gate_weight: torch.Tensor,
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
-        gate = gate_input if gate_weight is None else F.linear(gate_input, gate_weight)
-        return F.sigmoid(gate) * x
+        gate = torch.matmul(gate_input, gate_weight.reshape(-1)).unsqueeze(-1)
+        return torch.sigmoid(gate) * x
 
     def forward_cuda(
         self,
         x: torch.Tensor,
         gate_input: torch.Tensor,
-        gate_weight: torch.Tensor | None = None,
+        gate_weight: torch.Tensor,
     ) -> torch.Tensor:
         x = x.reshape(-1, x.shape[-1])
+        gate_input = gate_input.reshape(-1, gate_input.shape[-1])
+        num_tokens, d = x.shape
+        assert gate_input.shape == x.shape
+        assert gate_weight.numel() == d
         out = torch.empty_like(x, memory_format=torch.contiguous_format)
-        if gate_weight is None:
-            sigmoid_gate_mul_triton(out, x, gate_input.reshape(-1))
-        else:
-            gemv_gate_mul_triton(
-                out,
-                x,
-                gate_input.reshape(-1, gate_input.shape[-1]),
-                gate_weight.reshape(-1),
-            )
+        _gemv_gate_mul_kernel[(num_tokens,)](
+            out,
+            out.stride(0),
+            x,
+            x.stride(0),
+            gate_input,
+            gate_input.stride(0),
+            gate_weight.reshape(-1),
+            d=d,
+            BLOCK_SIZE=4096,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+            num_warps=8,
+        )
         return out
 
 
@@ -272,13 +204,14 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
-        self.gate_mul = SigmoidGateMul() if expert_gate is not None else None
         # The fused gate GEMV requires the unquantized, bias-free
-        # ReplicatedLinear; anything else falls back to the unfused path.
-        self.fuse_expert_gate = (
-            expert_gate is not None
+        # ReplicatedLinear; anything else runs the gate eagerly.
+        self.gate_mul = (
+            SigmoidGateMul()
+            if expert_gate is not None
             and isinstance(expert_gate.quant_method, UnquantizedLinearMethod)
             and expert_gate.bias is None
+            else None
         )
 
     def forward(self, x):
@@ -287,11 +220,10 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            assert self.gate_mul is not None
-            if self.fuse_expert_gate:
+            if self.gate_mul is not None:
                 out = self.gate_mul(out, x, self.expert_gate.weight)
             else:
-                out = self.gate_mul(out, self.expert_gate(x)[0])
+                out = torch.sigmoid(self.expert_gate(x)[0]) * out
 
         return out
 
