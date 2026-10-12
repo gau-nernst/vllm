@@ -77,7 +77,7 @@ logger = init_logger(__name__)
 
 
 @triton.jit
-def _gemv_gate_mul_kernel(
+def _fused_shared_expert_gate_kernel(
     o_ptr,
     o_stride,
     z_ptr,
@@ -112,8 +112,33 @@ def _gemv_gate_mul_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-@CustomOp.register("sigmoid_gate_mul")
-class SigmoidGateMul(CustomOp):
+def fused_shared_expert_gate_triton(
+    output: torch.Tensor,
+    z: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+):
+    num_tokens, d = z.shape
+    assert x.shape == z.shape
+    assert weight.numel() == d
+
+    _fused_shared_expert_gate_kernel[(num_tokens,)](
+        output,
+        output.stride(0),
+        z,
+        z.stride(0),
+        x,
+        x.stride(0),
+        weight,
+        d=d,
+        BLOCK_SIZE=4096,
+        launch_pdl=current_platform.is_arch_support_pdl(),
+        num_warps=8,
+    )
+
+
+@CustomOp.register("fused_shared_expert_gate")
+class FusedSharedExpertGate(CustomOp):
     """Per-token sigmoid gating for gated shared experts, with the gate
     projection (a per-token scalar GEMV) fused in.
 
@@ -145,23 +170,12 @@ class SigmoidGateMul(CustomOp):
         gate_weight: torch.Tensor,
     ) -> torch.Tensor:
         x = x.reshape(-1, x.shape[-1])
-        gate_input = gate_input.reshape(-1, gate_input.shape[-1])
-        num_tokens, d = x.shape
-        assert gate_input.shape == x.shape
-        assert gate_weight.numel() == d
         out = torch.empty_like(x, memory_format=torch.contiguous_format)
-        _gemv_gate_mul_kernel[(num_tokens,)](
+        fused_shared_expert_gate_triton(
             out,
-            out.stride(0),
             x,
-            x.stride(0),
-            gate_input,
-            gate_input.stride(0),
+            gate_input.reshape(-1, gate_input.shape[-1]),
             gate_weight.reshape(-1),
-            d=d,
-            BLOCK_SIZE=4096,
-            launch_pdl=current_platform.is_arch_support_pdl(),
-            num_warps=8,
         )
         return out
 
@@ -206,8 +220,8 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
         # The fused gate GEMV requires the unquantized, bias-free
         # ReplicatedLinear; anything else runs the gate eagerly.
-        self.gate_mul = (
-            SigmoidGateMul()
+        self.fused_gate = (
+            FusedSharedExpertGate()
             if expert_gate is not None
             and isinstance(expert_gate.quant_method, UnquantizedLinearMethod)
             and expert_gate.bias is None
@@ -220,8 +234,8 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            if self.gate_mul is not None:
-                out = self.gate_mul(out, x, self.expert_gate.weight)
+            if self.fused_gate is not None:
+                out = self.fused_gate(out, x, self.expert_gate.weight)
             else:
                 out = torch.sigmoid(self.expert_gate(x)[0]) * out
 

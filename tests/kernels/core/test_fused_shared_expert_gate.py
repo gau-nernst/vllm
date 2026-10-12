@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from tests.kernels.allclose_default import get_default_atol, get_default_rtol
-from vllm.model_executor.models.qwen2_moe import SigmoidGateMul
+from vllm.model_executor.models.qwen2_moe import FusedSharedExpertGate
 from vllm.utils.torch_utils import set_random_seed
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
@@ -22,7 +22,7 @@ CUDA_DEVICES = [
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_sigmoid_gate_mul(
+def test_fused_shared_expert_gate(
     default_vllm_config,
     num_tokens: int,
     d: int,
@@ -32,7 +32,7 @@ def test_sigmoid_gate_mul(
 ) -> None:
     set_random_seed(seed)
     torch.set_default_device(device)
-    layer = SigmoidGateMul()
+    layer = FusedSharedExpertGate()
     z = torch.randn(num_tokens, d, dtype=dtype)
     x = torch.randn(num_tokens, d, dtype=dtype)
     weight = torch.randn(1, d, dtype=dtype)

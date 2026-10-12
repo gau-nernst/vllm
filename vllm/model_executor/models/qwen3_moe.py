@@ -72,7 +72,7 @@ from .interfaces import (
     SupportsPP,
     SupportsQuant,
 )
-from .qwen2_moe import SigmoidGateMul
+from .qwen2_moe import FusedSharedExpertGate
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -121,8 +121,8 @@ class Qwen3MoeMLP(nn.Module):
         self.expert_gate = expert_gate
         # The fused gate GEMV requires the unquantized, bias-free
         # ReplicatedLinear; anything else runs the gate eagerly.
-        self.gate_mul = (
-            SigmoidGateMul()
+        self.fused_gate = (
+            FusedSharedExpertGate()
             if expert_gate is not None
             and isinstance(expert_gate.quant_method, UnquantizedLinearMethod)
             and expert_gate.bias is None
@@ -135,8 +135,8 @@ class Qwen3MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            if self.gate_mul is not None:
-                out = self.gate_mul(out, x, self.expert_gate.weight)
+            if self.fused_gate is not None:
+                out = self.fused_gate(out, x, self.expert_gate.weight)
             else:
                 out = torch.sigmoid(self.expert_gate(x)[0]) * out
 
