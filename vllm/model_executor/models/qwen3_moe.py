@@ -28,7 +28,6 @@ from itertools import islice
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
@@ -40,7 +39,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.activation import SigmoidGateMul, SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -118,6 +117,7 @@ class Qwen3MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        self.gate_mul = SigmoidGateMul() if expert_gate is not None else None
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -125,7 +125,9 @@ class Qwen3MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            assert self.gate_mul is not None
+            gate_logits, _ = self.expert_gate(x)
+            out = self.gate_mul(out, gate_logits)
 
         return out
 
