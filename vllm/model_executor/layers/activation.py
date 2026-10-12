@@ -69,6 +69,48 @@ def swiglustep_and_mul_triton(
     )
 
 
+@triton.jit
+def _sigmoid_gate_mul_kernel(
+    o_ptr,
+    o_stride,
+    x_ptr,
+    x_stride,
+    g_ptr,
+    d,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    i = tl.program_id(axis=0).to(tl.int64)
+    j = tl.program_id(axis=1)
+    g = tl.load(g_ptr + i).to(tl.float32)
+    s = tl.sigmoid(g)
+    o_row_ptr = o_ptr + o_stride * i
+    x_row_ptr = x_ptr + x_stride * i
+    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < d
+    x = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
+    tl.store(o_row_ptr + offsets, (x * s).to(o_ptr.dtype.element_ty), mask=mask)
+
+
+def sigmoid_gate_mul_triton(
+    output: torch.Tensor, input: torch.Tensor, gate: torch.Tensor
+):
+    num_tokens, d = input.shape
+    assert gate.numel() == num_tokens
+
+    def grid(meta):
+        return (num_tokens, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    _sigmoid_gate_mul_kernel[grid](
+        output,
+        output.stride(0),
+        input,
+        input.stride(0),
+        gate,
+        d=d,
+        BLOCK_SIZE=1024,
+    )
+
+
 # --8<-- [start:fatrelu_and_mul]
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
@@ -549,6 +591,30 @@ class SwigluStepAndMul(CustomOp):
 
     def extra_repr(self) -> str:
         return f"limit={repr(self.limit)}"
+
+
+@CustomOp.register("sigmoid_gate_mul")
+class SigmoidGateMul(CustomOp):
+    """Per-token sigmoid gating, used by gated shared experts.
+
+    Computes (x, gate) -> sigmoid(gate) * x where gate holds one logit per
+    token, broadcast over the hidden dimension.
+
+    Shapes:
+        x: (num_tokens, d)
+        gate: (num_tokens, 1) or (num_tokens,)
+        return: (num_tokens, d)
+    """
+
+    def forward_native(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        return F.sigmoid(gate) * x
+
+    def forward_cuda(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        x = x.reshape(-1, x.shape[-1])
+        out = torch.empty_like(x, memory_format=torch.contiguous_format)
+        sigmoid_gate_mul_triton(out, x, gate.reshape(-1))
+        return out
 
 
 # --8<-- [start:gelu_new]

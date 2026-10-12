@@ -17,6 +17,7 @@ from vllm.model_executor.layers.activation import (
     NewGELU,
     QuickGELU,
     ReLUSquaredActivation,
+    SigmoidGateMul,
     SiluAndMul,
     SiluAndMulWithClamp,
     SwigluOAIAndMul,
@@ -235,6 +236,46 @@ def test_swiglu_limit_func_without_routing_uses_output_buffer() -> None:
     )
 
     torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("d", D)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sigmoid_gate_mul(
+    default_vllm_config,
+    num_tokens: int,
+    d: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    set_random_seed(seed)
+    torch.set_default_device(device)
+    layer = SigmoidGateMul()
+    x = torch.randn(num_tokens, d, dtype=dtype)
+    gate = torch.randn(num_tokens, 1, dtype=dtype)
+    # Saturating logits exercise the sigmoid tails.
+    gate[0] = 100.0
+    gate[-1] = -100.0
+
+    out = layer(x, gate)
+    ref_out = layer.forward_native(x, gate)
+    torch.testing.assert_close(
+        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
+    )
+
+    # Row-strided input (every other row of a wider buffer).
+    base = torch.randn(2 * num_tokens, d, dtype=dtype)
+    gate2 = torch.randn(2 * num_tokens, 1, dtype=dtype)
+    strided = base[::2]
+    out = layer(strided, gate2[::2])
+    ref_out = layer.forward_native(strided, gate2[::2])
+    torch.testing.assert_close(
+        out, ref_out, atol=get_default_atol(out), rtol=get_default_rtol(out)
+    )
 
 
 @pytest.mark.parametrize(
