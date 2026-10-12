@@ -126,8 +126,7 @@ class Qwen3MoeMLP(nn.Module):
 
         if self.expert_gate is not None:
             assert self.gate_mul is not None
-            gate_logits, _ = self.expert_gate(x)
-            out = self.gate_mul(out, gate_logits)
+            out = self.gate_mul(out, self.expert_gate(x)[0])
 
         return out
 
