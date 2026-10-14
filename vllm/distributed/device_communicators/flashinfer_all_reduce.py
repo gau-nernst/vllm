@@ -6,7 +6,6 @@ import atexit
 import os
 import random
 import threading
-from contextlib import ExitStack
 from typing import Any
 
 import torch
@@ -31,13 +30,16 @@ PDL_ADVANCE_LAUNCH_TOKENS = 16
 MiB = 1024 * 1024
 
 fi_ar_available = False
+fi_mnnvl_safe_init = False
 try:
     import flashinfer.comm as flashinfer_comm  # type: ignore[no-redef]
     from flashinfer.comm.mnnvl import (
+        SymmDeviceMemory,
         TorchDistBackend,  # type: ignore[import-not-found, no-redef]
     )
 
     fi_ar_available = hasattr(flashinfer_comm, "allreduce_fusion")
+    fi_mnnvl_safe_init = getattr(SymmDeviceMemory, "collective_init_supported", False)
 except ImportError:
     pass
 
@@ -82,15 +84,6 @@ def _create_workspace(
 ):
     """Create a flashinfer allreduce workspace, returning None on failure."""
     comm_backend = TorchDistBackend(group=group)
-    if backend == "mnnvl":
-        # Vote before handle exchange: a local allocation failure otherwise
-        # leaves the other ranks blocked inside workspace creation.
-        local_ready = _probe_mnnvl_workspace(
-            world_size, max_token_num, hidden_dim, dtype, _node_count(group) > 1
-        )
-        if not all(comm_backend.allgather(local_ready)):
-            logger.warning_once("FlashInfer MNNVL workspace preflight failed.")
-            return None
     rng_state = random.getstate()
     workspace = None
     try:
@@ -114,16 +107,16 @@ def _create_workspace(
                 "Failed to initialize FlashInfer All Reduce workspace: %s. "
                 "This is expected on GPUs without NVSwitch (e.g., NVLink "
                 "bridge-only or PCIe topologies).",
-                e,
+                str(e),
             )
         else:
             logger.warning_once(
                 "Failed to initialize FlashInfer All Reduce workspace: %s.",
-                e,
+                str(e),
             )
     finally:
         random.setstate(rng_state)
-    if backend == "mnnvl":
+    if backend == "mnnvl" and fi_mnnvl_safe_init:
         local_ready = workspace is not None and bool(getattr(workspace, "mc_ptr", 0))
         if not all(comm_backend.allgather(local_ready)):
             if workspace is not None:
@@ -131,6 +124,10 @@ def _create_workspace(
             logger.warning_once("FlashInfer MNNVL workspace unavailable on a rank.")
             return None
     elif workspace is None:
+        return None
+    elif backend == "mnnvl" and not getattr(workspace, "mc_ptr", 0):
+        workspace.destroy()
+        logger.warning_once("FlashInfer MNNVL multicast is unavailable.")
         return None
     workspace_id = id(workspace)
     workspace_group = _fi_ar_workspace_groups.get(workspace_id)
@@ -151,110 +148,6 @@ def _create_workspace(
         dtype,
     )
     return workspace
-
-
-def _probe_mnnvl_workspace(
-    world_size: int,
-    max_token_num: int,
-    hidden_dim: int,
-    dtype: torch.dtype,
-    multi_node: bool = False,
-) -> bool:
-    """Probe local multicast and physical allocation before collective creation."""
-    try:
-        from cuda.bindings import driver as cuda
-        from flashinfer.comm.mnnvl import (
-            SIGNAL_PAD_SIZE,
-            MnnvlMemory,
-            is_mnnvl_fabric_supported,
-            round_up,
-        )
-        from flashinfer.comm.trtllm_mnnvl_ar import (
-            MNNVL_ONE_SHOT_THRESHOLD,
-            MNNVLAllreduceFusionStrategy,
-            MNNVLAllReduceFusionWorkspace,
-        )
-        from flashinfer.cuda_utils import checkCudaErrors
-
-        from vllm.distributed.device_communicators.custom_all_reduce import (
-            _has_local_multicast_support,
-        )
-
-        device = torch.accelerator.current_device_index()
-        if not _has_local_multicast_support(torch.device("cuda", device)):
-            return False
-        fabric_supported = is_mnnvl_fabric_supported(device)
-        if multi_node and not fabric_supported:
-            return False
-        prop = MnnvlMemory.get_allocation_prop(device)
-        prop.allocFlags.gpuDirectRDMACapable = 1
-        prop.requestedHandleTypes = (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            if fabric_supported
-            else cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
-        element_size = torch.empty((), dtype=dtype).element_size()
-        oneshot_tokens = min(
-            max_token_num,
-            MNNVL_ONE_SHOT_THRESHOLD // (world_size * hidden_dim * element_size),
-        )
-        ws = MNNVLAllReduceFusionWorkspace
-        buffer_size = max(
-            ws.get_required_buffer_size_bytes(
-                world_size,
-                oneshot_tokens,
-                hidden_dim,
-                dtype,
-                MNNVLAllreduceFusionStrategy.ONESHOT,
-            ),
-            ws.get_required_buffer_size_bytes(
-                world_size,
-                max_token_num,
-                hidden_dim,
-                dtype,
-                MNNVLAllreduceFusionStrategy.TWOSHOT,
-            ),
-        )
-        size = round_up(buffer_size, ws.TWOSHOT_NUM_STAGES * ws.PACKED_ALIGNMENT_BYTES)
-        if size > 2**32 - 1:
-            return False
-        size = size * ws.NUM_LAMPORT_BUFFERS + SIGNAL_PAD_SIZE
-        granularity = checkCudaErrors(
-            cuda.cuMemGetAllocationGranularity(
-                prop,
-                cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
-            )
-        )
-        size = round_up(size, granularity)
-        mc = cuda.CUmulticastObjectProp()
-        mc.numDevices = world_size
-        mc.size = size
-        mc.handleTypes = prop.requestedHandleTypes
-        granularity = checkCudaErrors(
-            cuda.cuMulticastGetGranularity(
-                mc,
-                cuda.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
-            )
-        )
-        size = round_up(size, granularity)
-        with ExitStack() as cleanup:
-            handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
-            cleanup.callback(lambda: checkCudaErrors(cuda.cuMemRelease(handle)))
-            exported = checkCudaErrors(
-                cuda.cuMemExportToShareableHandle(handle, prop.requestedHandleTypes, 0)
-            )
-            if prop.requestedHandleTypes == (
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-            ):
-                cleanup.callback(os.close, exported)
-            # Do not bind or exchange handles until every rank has voted.
-            mc.size = size
-            multicast = checkCudaErrors(cuda.cuMulticastCreate(mc))
-            cleanup.callback(lambda: checkCudaErrors(cuda.cuMemRelease(multicast)))
-        return True
-    except Exception as error:
-        logger.debug("FlashInfer MNNVL preflight failed: %s", error)
-        return False
 
 
 def _resolve_fi_ar_backend(group: ProcessGroup) -> tuple[str | None, bool]:
@@ -279,14 +172,16 @@ def _resolve_fi_ar_backend(group: ProcessGroup) -> tuple[str | None, bool]:
         )
 
         device = torch.device("cuda", torch.accelerator.current_device_index())
-        local_ready = current_platform.has_device_capability(100) and (
-            _has_local_multicast_support(device)
+        local_ready = (
+            fi_mnnvl_safe_init
+            and current_platform.has_device_capability(100)
+            and _has_local_multicast_support(device)
         )
         if all(TorchDistBackend(group=group).allgather(local_ready)):
             backend = "mnnvl"
-        # An allocation/mapping failure disables FI collectively. Retrying a
-        # different collective workspace here can hang under memory pressure.
-        allow_trtllm_fallback = False
+        # FlashInfer agrees on local initialization errors before its next
+        # collective, so every rank can safely enter the fallback together.
+        allow_trtllm_fallback = backend == "mnnvl"
     elif current_platform.has_device_capability(100):
         # MNNVL requires Blackwell-class GPUs and is the only supported
         # FlashInfer backend for a multi-node allreduce process group.
@@ -332,20 +227,22 @@ def get_fi_ar_workspace(
             "'trtllm' backend. Please use 'mnnvl' backend instead."
         )
 
-    if (
-        envs.VLLM_ALLREDUCE_USE_FLASHINFER
-        and (max_size := _get_tuned_standalone_max_size(world_size, backend, group))
-        is not None
-    ):
-        element_size = torch.empty((), dtype=dtype, device="cpu").element_size()
-        max_token_num = max(max_token_num, max_size // (hidden_dim * element_size))
-
     def _get_or_create(be: str):
+        workspace_tokens = max_token_num
+        if (
+            envs.VLLM_ALLREDUCE_USE_FLASHINFER
+            and (max_size := _get_tuned_standalone_max_size(world_size, be, group))
+            is not None
+        ):
+            element_size = torch.empty((), dtype=dtype, device="cpu").element_size()
+            workspace_tokens = max(
+                workspace_tokens, max_size // (hidden_dim * element_size)
+            )
         # Reuse the quant workspace if it was already created with the same backend
         if _fi_ar_quant_workspace is not None and _fi_ar_quant_workspace.backend == be:
             return _fi_ar_quant_workspace
         return _create_workspace(
-            be, world_size, rank, max_token_num, hidden_dim, dtype, group
+            be, world_size, rank, workspace_tokens, hidden_dim, dtype, group
         )
 
     _fi_ar_workspace = _get_or_create(backend)
@@ -565,6 +462,7 @@ class FlashInferAllReduce:
             backend,
             self.group,
         )
+        self.default_max_workspace_size = int(default_max_size_mb * MiB)
         self.max_workspace_size = (
             tuned_max_size
             if tuned_max_size is not None
@@ -575,13 +473,14 @@ class FlashInferAllReduce:
 
     def _ensure_workspace(self, hidden_dim: int, dtype: torch.dtype) -> bool:
         """Ensure the all reduce workspace is initialized."""
-        if self.max_num_tokens == 0:
-            element_size = torch.tensor([], dtype=dtype, device="cpu").element_size()
-            self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
+        if self.max_num_tokens:
+            return True
+        element_size = dtype.itemsize
         workspace = get_fi_ar_workspace(
             world_size=self.world_size,
             rank=self.rank,
-            max_token_num=self.max_num_tokens,
+            max_token_num=self.default_max_workspace_size
+            // (hidden_dim * element_size),
             hidden_dim=hidden_dim,
             dtype=dtype,
             group=self.group,
@@ -589,6 +488,13 @@ class FlashInferAllReduce:
         if workspace is None:
             self.disabled = True
             return False
+        max_size = _get_tuned_standalone_max_size(
+            self.world_size, workspace.backend, self.group
+        )
+        self.max_workspace_size = (
+            max_size if max_size is not None else self.default_max_workspace_size
+        )
+        self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
         return True
 
     def should_use_fi_ar(self, input_tensor: torch.Tensor) -> bool:
@@ -615,14 +521,13 @@ class FlashInferAllReduce:
             return False
 
         num_tokens, hidden_dim = input_tensor.shape
-        if not self.max_num_tokens:
-            element_size = torch.tensor([], dtype=input_tensor.dtype).element_size()
-            self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
-
-        if num_tokens > self.max_num_tokens:
+        if not self._ensure_workspace(hidden_dim, input_tensor.dtype):
             return False
 
-        if not self._ensure_workspace(hidden_dim, input_tensor.dtype):
+        if (
+            input_tensor.nbytes > self.max_workspace_size
+            or num_tokens > self.max_num_tokens
+        ):
             return False
 
         workspace = get_fi_ar_workspace(
