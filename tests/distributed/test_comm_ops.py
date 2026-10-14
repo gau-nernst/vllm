@@ -478,13 +478,15 @@ def test_flashinfer_auto_backend_uses_group_topology(
     peer_ready: bool,
     expected: tuple[str | None, bool],
 ) -> None:
-    from flashinfer.comm import mnnvl
+    from vllm.distributed.device_communicators import custom_all_reduce
 
     group = Mock()
     vote = Mock(side_effect=lambda local: [local, peer_ready])
     comm_backend = Mock(return_value=Mock(allgather=vote))
     monkeypatch.setattr(flashinfer_all_reduce, "TorchDistBackend", comm_backend)
-    monkeypatch.setattr(mnnvl, "is_multicast_supported", lambda _: multicast)
+    monkeypatch.setattr(
+        custom_all_reduce, "_has_local_multicast_support", lambda _: multicast
+    )
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
         flashinfer_all_reduce.envs, "VLLM_FLASHINFER_ALLREDUCE_BACKEND", "auto"
@@ -548,9 +550,13 @@ def test_flashinfer_unsupported_topology_skips_allocation(
     from cuda.bindings import driver
     from flashinfer.comm import mnnvl
 
+    from vllm.distributed.device_communicators import custom_all_reduce
+
     allocate = Mock(side_effect=AssertionError("unsupported workspace allocation"))
     monkeypatch.setattr(driver, "cuMemCreate", allocate)
-    monkeypatch.setattr(mnnvl, "is_multicast_supported", lambda _: multicast)
+    monkeypatch.setattr(
+        custom_all_reduce, "_has_local_multicast_support", lambda _: multicast
+    )
     monkeypatch.setattr(mnnvl, "is_mnnvl_fabric_supported", lambda _: False)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
 

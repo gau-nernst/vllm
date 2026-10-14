@@ -6,6 +6,7 @@ import atexit
 import os
 import random
 import threading
+from contextlib import ExitStack
 from typing import Any
 
 import torch
@@ -160,15 +161,12 @@ def _probe_mnnvl_workspace(
     multi_node: bool = False,
 ) -> bool:
     """Probe local multicast and physical allocation before collective creation."""
-    handle = None
-    multicast_handle = None
-    ready = False
     try:
         from cuda.bindings import driver as cuda
         from flashinfer.comm.mnnvl import (
             SIGNAL_PAD_SIZE,
+            MnnvlMemory,
             is_mnnvl_fabric_supported,
-            is_multicast_supported,
             round_up,
         )
         from flashinfer.comm.trtllm_mnnvl_ar import (
@@ -178,16 +176,17 @@ def _probe_mnnvl_workspace(
         )
         from flashinfer.cuda_utils import checkCudaErrors
 
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            _has_local_multicast_support,
+        )
+
         device = torch.accelerator.current_device_index()
-        if not is_multicast_supported(device):
+        if not _has_local_multicast_support(torch.device("cuda", device)):
             return False
         fabric_supported = is_mnnvl_fabric_supported(device)
         if multi_node and not fabric_supported:
             return False
-        prop = cuda.CUmemAllocationProp()
-        prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-        prop.location.id = device
+        prop = MnnvlMemory.get_allocation_prop(device)
         prop.allocFlags.gpuDirectRDMACapable = 1
         prop.requestedHandleTypes = (
             cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
@@ -238,30 +237,24 @@ def _probe_mnnvl_workspace(
             )
         )
         size = round_up(size, granularity)
-        handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
-        exported_handle = checkCudaErrors(
-            cuda.cuMemExportToShareableHandle(handle, prop.requestedHandleTypes, 0)
-        )
-        if prop.requestedHandleTypes == (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        ):
-            os.close(exported_handle)
-        # Creating the object is local. Do not bind memory or exchange handles
-        # until every rank has voted on its allocation results.
-        mc.size = size
-        multicast_handle = checkCudaErrors(cuda.cuMulticastCreate(mc))
-        ready = True
+        with ExitStack() as cleanup:
+            handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
+            cleanup.callback(lambda: checkCudaErrors(cuda.cuMemRelease(handle)))
+            exported = checkCudaErrors(
+                cuda.cuMemExportToShareableHandle(handle, prop.requestedHandleTypes, 0)
+            )
+            if prop.requestedHandleTypes == (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            ):
+                cleanup.callback(os.close, exported)
+            # Do not bind or exchange handles until every rank has voted.
+            mc.size = size
+            multicast = checkCudaErrors(cuda.cuMulticastCreate(mc))
+            cleanup.callback(lambda: checkCudaErrors(cuda.cuMemRelease(multicast)))
+        return True
     except Exception as error:
         logger.debug("FlashInfer MNNVL preflight failed: %s", error)
-    finally:
-        for allocated_handle in (multicast_handle, handle):
-            if allocated_handle is not None:
-                try:
-                    checkCudaErrors(cuda.cuMemRelease(allocated_handle))
-                except Exception as error:
-                    logger.debug("FlashInfer MNNVL preflight cleanup failed: %s", error)
-                    ready = False
-    return ready
+        return False
 
 
 def _resolve_fi_ar_backend(group: ProcessGroup) -> tuple[str | None, bool]:
@@ -281,15 +274,14 @@ def _resolve_fi_ar_backend(group: ProcessGroup) -> tuple[str | None, bool]:
     node_count = _node_count(group)
     if node_count == 1:
         backend = "trtllm"
-        local_ready = False
-        try:
-            from flashinfer.comm.mnnvl import is_multicast_supported
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            _has_local_multicast_support,
+        )
 
-            local_ready = current_platform.has_device_capability(100) and (
-                is_multicast_supported(torch.accelerator.current_device_index())
-            )
-        except Exception as error:
-            logger.debug("FlashInfer multicast probe failed: %s", error)
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        local_ready = current_platform.has_device_capability(100) and (
+            _has_local_multicast_support(device)
+        )
         if all(TorchDistBackend(group=group).allgather(local_ready)):
             backend = "mnnvl"
         # An allocation/mapping failure disables FI collectively. Retrying a
