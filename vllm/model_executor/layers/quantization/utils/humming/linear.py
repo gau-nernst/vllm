@@ -156,8 +156,7 @@ def prepare_humming_linear_layer_config(
         param = torch.nn.Parameter(tensor, requires_grad=False)
         setattr(layer, name, param)
 
-    layer._humming_key = f"humming_{id(layer)}"
-    _HUMMING_LAYERS[layer._humming_key] = (layer, config)
+    _HUMMING_LAYERS[layer.prefix] = (layer, config)
     return config
 
 
@@ -219,7 +218,7 @@ def apply_humming_linear(
     # layer_config is the one registered in prepare_humming_linear_layer_config
     output = torch.ops.vllm.humming_linear(
         x.reshape(-1, x.size(-1)),
-        layer._humming_key,
+        layer.prefix,
         compute_config,
         locks,
         skip_bias_add,
