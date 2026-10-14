@@ -81,7 +81,17 @@ def _create_workspace(
 ):
     """Create a flashinfer allreduce workspace, returning None on failure."""
     comm_backend = TorchDistBackend(group=group)
+    if backend == "mnnvl":
+        # Vote before handle exchange: a local allocation failure otherwise
+        # leaves the other ranks blocked inside workspace creation.
+        local_ready = _probe_mnnvl_workspace(
+            world_size, max_token_num, hidden_dim, dtype, _node_count(group) > 1
+        )
+        if not all(comm_backend.allgather(local_ready)):
+            logger.warning_once("FlashInfer MNNVL workspace preflight failed.")
+            return None
     rng_state = random.getstate()
+    workspace = None
     try:
         random.seed(int.from_bytes(os.urandom(16), byteorder="big"))
         # Creation may run lazily inside the first sync-checked forward (e.g.
@@ -97,12 +107,6 @@ def _create_workspace(
                 comm_backend=comm_backend,
                 group=group,
             )
-        if backend == "mnnvl" and not getattr(workspace, "mc_ptr", 0):
-            workspace.destroy()
-            logger.warning_once(
-                "FlashInfer MNNVL multicast is unavailable on the current topology."
-            )
-            return None
     except Exception as e:
         if "multicast" in str(e).lower():
             logger.warning_once(
@@ -116,9 +120,17 @@ def _create_workspace(
                 "Failed to initialize FlashInfer All Reduce workspace: %s.",
                 e,
             )
-        return None
     finally:
         random.setstate(rng_state)
+    if backend == "mnnvl":
+        local_ready = workspace is not None and bool(getattr(workspace, "mc_ptr", 0))
+        if not all(comm_backend.allgather(local_ready)):
+            if workspace is not None:
+                workspace.destroy()
+            logger.warning_once("FlashInfer MNNVL workspace unavailable on a rank.")
+            return None
+    elif workspace is None:
+        return None
     workspace_id = id(workspace)
     workspace_group = _fi_ar_workspace_groups.get(workspace_id)
     if workspace_group is not None and workspace_group is not group:
@@ -140,6 +152,118 @@ def _create_workspace(
     return workspace
 
 
+def _probe_mnnvl_workspace(
+    world_size: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    multi_node: bool = False,
+) -> bool:
+    """Probe local multicast and physical allocation before collective creation."""
+    handle = None
+    multicast_handle = None
+    ready = False
+    try:
+        from cuda.bindings import driver as cuda
+        from flashinfer.comm.mnnvl import (
+            SIGNAL_PAD_SIZE,
+            is_mnnvl_fabric_supported,
+            is_multicast_supported,
+            round_up,
+        )
+        from flashinfer.comm.trtllm_mnnvl_ar import (
+            MNNVL_ONE_SHOT_THRESHOLD,
+            MNNVLAllreduceFusionStrategy,
+            MNNVLAllReduceFusionWorkspace,
+        )
+        from flashinfer.cuda_utils import checkCudaErrors
+
+        device = torch.accelerator.current_device_index()
+        if not is_multicast_supported(device):
+            return False
+        fabric_supported = is_mnnvl_fabric_supported(device)
+        if multi_node and not fabric_supported:
+            return False
+        prop = cuda.CUmemAllocationProp()
+        prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = device
+        prop.allocFlags.gpuDirectRDMACapable = 1
+        prop.requestedHandleTypes = (
+            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            if fabric_supported
+            else cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+        element_size = torch.empty((), dtype=dtype).element_size()
+        oneshot_tokens = min(
+            max_token_num,
+            MNNVL_ONE_SHOT_THRESHOLD // (world_size * hidden_dim * element_size),
+        )
+        ws = MNNVLAllReduceFusionWorkspace
+        buffer_size = max(
+            ws.get_required_buffer_size_bytes(
+                world_size,
+                oneshot_tokens,
+                hidden_dim,
+                dtype,
+                MNNVLAllreduceFusionStrategy.ONESHOT,
+            ),
+            ws.get_required_buffer_size_bytes(
+                world_size,
+                max_token_num,
+                hidden_dim,
+                dtype,
+                MNNVLAllreduceFusionStrategy.TWOSHOT,
+            ),
+        )
+        size = round_up(buffer_size, ws.TWOSHOT_NUM_STAGES * ws.PACKED_ALIGNMENT_BYTES)
+        if size > 2**32 - 1:
+            return False
+        size = size * ws.NUM_LAMPORT_BUFFERS + SIGNAL_PAD_SIZE
+        granularity = checkCudaErrors(
+            cuda.cuMemGetAllocationGranularity(
+                prop,
+                cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+            )
+        )
+        size = round_up(size, granularity)
+        mc = cuda.CUmulticastObjectProp()
+        mc.numDevices = world_size
+        mc.size = size
+        mc.handleTypes = prop.requestedHandleTypes
+        granularity = checkCudaErrors(
+            cuda.cuMulticastGetGranularity(
+                mc,
+                cuda.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_RECOMMENDED,
+            )
+        )
+        size = round_up(size, granularity)
+        handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
+        exported_handle = checkCudaErrors(
+            cuda.cuMemExportToShareableHandle(handle, prop.requestedHandleTypes, 0)
+        )
+        if prop.requestedHandleTypes == (
+            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        ):
+            os.close(exported_handle)
+        # Creating the object is local. Do not bind memory or exchange handles
+        # until every rank has voted on its allocation results.
+        mc.size = size
+        multicast_handle = checkCudaErrors(cuda.cuMulticastCreate(mc))
+        ready = True
+    except Exception as error:
+        logger.debug("FlashInfer MNNVL preflight failed: %s", error)
+    finally:
+        for allocated_handle in (multicast_handle, handle):
+            if allocated_handle is not None:
+                try:
+                    checkCudaErrors(cuda.cuMemRelease(allocated_handle))
+                except Exception as error:
+                    logger.debug("FlashInfer MNNVL preflight cleanup failed: %s", error)
+                    ready = False
+    return ready
+
+
 def _resolve_fi_ar_backend(group: ProcessGroup) -> tuple[str | None, bool]:
     """Resolve the flashinfer allreduce backend for the current setup.
 
@@ -156,9 +280,20 @@ def _resolve_fi_ar_backend(group: ProcessGroup) -> tuple[str | None, bool]:
 
     node_count = _node_count(group)
     if node_count == 1:
-        # TRTLLM supports single-node allreduce on Hopper and Blackwell. Do not
-        # create an MNNVL workspace when the process group is node-local.
         backend = "trtllm"
+        local_ready = False
+        try:
+            from flashinfer.comm.mnnvl import is_multicast_supported
+
+            local_ready = current_platform.has_device_capability(100) and (
+                is_multicast_supported(torch.accelerator.current_device_index())
+            )
+        except Exception as error:
+            logger.debug("FlashInfer multicast probe failed: %s", error)
+        if all(TorchDistBackend(group=group).allgather(local_ready)):
+            backend = "mnnvl"
+        # An allocation/mapping failure disables FI collectively. Retrying a
+        # different collective workspace here can hang under memory pressure.
         allow_trtllm_fallback = False
     elif current_platform.has_device_capability(100):
         # MNNVL requires Blackwell-class GPUs and is the only supported
@@ -256,8 +391,8 @@ def get_fi_ar_quant_workspace(
     """Return the allreduce workspace for quant patterns, initializing if needed.
 
     Backend is controlled by VLLM_FLASHINFER_ALLREDUCE_BACKEND env var, matching
-    non-quant fusion. With ``auto`` this prefers mnnvl and falls back to trtllm
-    only on single-node topologies where mnnvl multicast is unavailable.
+    non-quant fusion. Single-node ``auto`` selects MNNVL only when every
+    Blackwell rank supports multicast; Hopper continues to use TRTLLM.
     """
     global _fi_ar_quant_workspace, _fi_ar_quant_workspace_failed
     if _fi_ar_quant_workspace is not None or _fi_ar_quant_workspace_failed:

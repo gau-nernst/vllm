@@ -460,20 +460,32 @@ def test_flashinfer_standalone_workspace_size(
 
 
 @pytest.mark.parametrize(
-    ("node_count", "is_blackwell", "expected"),
+    ("node_count", "is_blackwell", "multicast", "peer_ready", "expected"),
     [
-        (1, False, ("trtllm", False)),
-        (1, True, ("trtllm", False)),
-        (2, False, (None, False)),
-        (2, True, ("mnnvl", False)),
+        (1, False, True, False, ("trtllm", False)),
+        (1, True, True, True, ("mnnvl", False)),
+        (1, True, False, True, ("trtllm", False)),
+        (1, True, True, False, ("trtllm", False)),
+        (2, False, True, True, (None, False)),
+        (2, True, True, True, ("mnnvl", False)),
     ],
 )
 def test_flashinfer_auto_backend_uses_group_topology(
     monkeypatch: pytest.MonkeyPatch,
     node_count: int,
     is_blackwell: bool,
+    multicast: bool,
+    peer_ready: bool,
     expected: tuple[str | None, bool],
 ) -> None:
+    from flashinfer.comm import mnnvl
+
+    group = Mock()
+    vote = Mock(side_effect=lambda local: [local, peer_ready])
+    comm_backend = Mock(return_value=Mock(allgather=vote))
+    monkeypatch.setattr(flashinfer_all_reduce, "TorchDistBackend", comm_backend)
+    monkeypatch.setattr(mnnvl, "is_multicast_supported", lambda _: multicast)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
     monkeypatch.setattr(
         flashinfer_all_reduce.envs, "VLLM_FLASHINFER_ALLREDUCE_BACKEND", "auto"
     )
@@ -484,7 +496,92 @@ def test_flashinfer_auto_backend_uses_group_topology(
         lambda capability: is_blackwell,
     )
 
-    assert flashinfer_all_reduce._resolve_fi_ar_backend(Mock()) == expected
+    assert flashinfer_all_reduce._resolve_fi_ar_backend(group) == expected
+    if node_count == 1:
+        comm_backend.assert_called_once_with(group=group)
+        vote.assert_called_once_with(is_blackwell and multicast)
+    else:
+        vote.assert_not_called()
+
+
+@pytest.mark.parametrize(("local_ready", "peer_ready"), [(False, True), (True, False)])
+def test_flashinfer_preflight_failure_skips_collective_creation(
+    monkeypatch: pytest.MonkeyPatch, local_ready: bool, peer_ready: bool
+) -> None:
+    """One rank's failed allocation must keep every rank out of handle exchange."""
+    factory = Mock()
+    comm = Mock(allgather=Mock(return_value=[local_ready, peer_ready]))
+    monkeypatch.setattr(flashinfer_all_reduce, "TorchDistBackend", lambda group: comm)
+    monkeypatch.setattr(flashinfer_all_reduce, "_node_count", lambda group: 1)
+    monkeypatch.setattr(flashinfer_all_reduce, "flashinfer_comm", factory)
+    monkeypatch.setattr(
+        flashinfer_all_reduce, "_probe_mnnvl_workspace", lambda *args: local_ready
+    )
+
+    assert (
+        flashinfer_all_reduce._create_workspace(
+            "mnnvl", 2, 0, 128, 4096, torch.bfloat16, Mock()
+        )
+        is None
+    )
+    factory.create_allreduce_fusion_workspace.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["mnnvl", "trtllm"])
+def test_flashinfer_explicit_backend_skips_auto_probe(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    """Explicit overrides retain their backend rather than re-running selection."""
+    monkeypatch.setattr(
+        flashinfer_all_reduce.envs, "VLLM_FLASHINFER_ALLREDUCE_BACKEND", backend
+    )
+    topology = Mock(side_effect=AssertionError("unexpected auto probe"))
+    monkeypatch.setattr(flashinfer_all_reduce, "_node_count", topology)
+    assert flashinfer_all_reduce._resolve_fi_ar_backend(Mock()) == (backend, False)
+
+
+@pytest.mark.parametrize(("multicast", "multi_node"), [(False, False), (True, True)])
+def test_flashinfer_unsupported_topology_skips_allocation(
+    monkeypatch: pytest.MonkeyPatch, multicast: bool, multi_node: bool
+) -> None:
+    """Node-local multicast does not imply cross-node fabric connectivity."""
+    from cuda.bindings import driver
+    from flashinfer.comm import mnnvl
+
+    allocate = Mock(side_effect=AssertionError("unsupported workspace allocation"))
+    monkeypatch.setattr(driver, "cuMemCreate", allocate)
+    monkeypatch.setattr(mnnvl, "is_multicast_supported", lambda _: multicast)
+    monkeypatch.setattr(mnnvl, "is_mnnvl_fabric_supported", lambda _: False)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+
+    assert not flashinfer_all_reduce._probe_mnnvl_workspace(
+        4, 8192, 4096, torch.bfloat16, multi_node
+    )
+    allocate.assert_not_called()
+
+
+@pytest.mark.parametrize("local_valid", [False, True])
+def test_flashinfer_invalid_workspace_disables_all_ranks(
+    monkeypatch: pytest.MonkeyPatch, local_valid: bool
+) -> None:
+    """Successful ranks release their workspace if any peer cannot use multicast."""
+    workspace = Mock(mc_ptr=int(local_valid))
+    factory = Mock(create_allreduce_fusion_workspace=Mock(return_value=workspace))
+    comm = Mock(allgather=Mock(side_effect=[[True, True], [local_valid, False]]))
+    monkeypatch.setattr(flashinfer_all_reduce, "TorchDistBackend", lambda group: comm)
+    monkeypatch.setattr(flashinfer_all_reduce, "_node_count", lambda group: 1)
+    monkeypatch.setattr(flashinfer_all_reduce, "flashinfer_comm", factory)
+    monkeypatch.setattr(
+        flashinfer_all_reduce, "_probe_mnnvl_workspace", lambda *args: True
+    )
+
+    assert (
+        flashinfer_all_reduce._create_workspace(
+            "mnnvl", 2, 0, 128, 4096, torch.bfloat16, Mock()
+        )
+        is None
+    )
+    workspace.destroy.assert_called_once()
 
 
 def test_flashinfer_workspace_failure_is_not_retried(
