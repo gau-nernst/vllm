@@ -17,6 +17,8 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     xpu_sample,
     xpu_sampler_supported,
 )
+from vllm.v1.sample.ops.topk_topp_small_k import MAX_TOP_K as SMALL_TOP_K_MAX
+from vllm.v1.sample.ops.topk_topp_small_k import apply_top_k_top_p_small_k
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
@@ -86,6 +88,9 @@ class Sampler:
         # Whether processing may leave -inf in a request's logits (filters,
         # forcing, logits processors) rather than only scale them.
         self.may_mask_logits = np.zeros(max_num_reqs, dtype=bool)
+        # Whether anything but top-k/top-p changes a request's logits
+        # (masking, or temperature/min_p scaling).
+        self.needs_value_processing = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -104,6 +109,13 @@ class Sampler:
             may_mask |= processor.add_request(req_idx, sampling_params)
         self.needs_logits_processing[req_idx] = needs_processing or may_mask
         self.may_mask_logits[req_idx] = may_mask
+        # The fused small-k top-k/top-p path masks while casting; it cannot
+        # stand in for temperature/min_p scaling or any masking stage.
+        self.needs_value_processing[req_idx] = (
+            may_mask
+            or sampling_params.temperature not in (0.0, 1.0)
+            or sampling_params.min_p != 0.0
+        )
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
@@ -234,6 +246,22 @@ class Sampler:
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
+
+        if (
+            not skip_top_k_top_p
+            and logits.dtype == torch.bfloat16
+            and not np.any(self.needs_value_processing[idx_mapping_np])
+        ):
+            # Only top-k/top-p apply: mask while casting, in one kernel.
+            top_k, top_p, _ = self.sampling_states.get_top_k_top_p(
+                expanded_idx_mapping, idx_mapping_np, logits.shape[-1]
+            )
+            if (
+                top_k is not None
+                and np.max(self.sampling_states.top_k.np[idx_mapping_np])
+                <= SMALL_TOP_K_MAX
+            ):
+                return apply_top_k_top_p_small_k(logits, top_k, top_p)
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
