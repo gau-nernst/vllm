@@ -314,8 +314,12 @@ QWEN3_5_GEMM_PLANS_BY_CAPABILITY: dict[
         (96, 5120): {
             1: SkinnyGemmConfig(1, 128, 2, vector_width=2, static_k=5120),
             2: SkinnyGemmConfig(2, 128, 2, vector_width=2, static_k=5120),
+            3: SkinnyGemmConfig(3, 128, 2, k_unroll=4, vector_width=2, static_k=5120),
             4: SkinnyGemmConfig(4, 256, 2, vector_width=4, static_k=5120),
+            6: SkinnyGemmConfig(6, 128, 2, vector_width=8, static_k=5120),
             8: SkinnyGemmConfig(8, 256, 2, vector_width=2, static_k=5120),
+            9: SkinnyGemmConfig(9, 128, 2, vector_width=4, static_k=5120),
+            12: SkinnyGemmConfig(12, 128, 2, vector_width=2, static_k=5120),
         },
     },
 }
