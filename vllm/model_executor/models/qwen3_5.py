@@ -36,17 +36,24 @@ from transformers import (
     Qwen3_5TextConfig,
 )
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.cute_dsl.skinny_gemm import (
+    SkinnyGemmConfig,
+    row_stride_ok,
+    shape_dynamic_skinny_gemm,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -63,8 +70,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .interfaces import (
     HasInnerState,
@@ -295,6 +304,93 @@ class Qwen3_5Model(Qwen3NextModel):
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
+# Low-latency decode GEMMs
+QWEN3_5_GEMM_PLANS_BY_CAPABILITY: dict[
+    tuple[int, int] | None, dict[tuple[int, int], dict[int, SkinnyGemmConfig]]
+] = {
+    # Qwen3.8-27B, TP=1, on RTX 5090.
+    (12, 0): {
+        # GDN fused B/A projection.
+        (96, 5120): {
+            1: SkinnyGemmConfig(1, 128, 2, vector_width=2, static_k=5120),
+            2: SkinnyGemmConfig(2, 128, 2, vector_width=2, static_k=5120),
+            4: SkinnyGemmConfig(4, 256, 2, vector_width=4, static_k=5120),
+            8: SkinnyGemmConfig(8, 256, 2, vector_width=2, static_k=5120),
+        },
+    },
+}
+
+
+class Qwen3_5LowLatencyLinearMethod(UnquantizedLinearMethod):
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if bias is None and not envs.VLLM_BATCH_INVARIANT:
+            return torch.ops.vllm.qwen3_5_low_latency_gemm(x, layer.weight)
+        return super().apply(layer, x, bias)
+
+
+def _qwen3_5_low_latency_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    plans = QWEN3_5_GEMM_PLANS_BY_CAPABILITY.get(
+        current_platform.get_device_capability(), {}
+    )
+    config = plans.get((weight.shape[0], weight.shape[1]), {}).get(x.shape[0])
+    if (
+        config is not None
+        and x.dim() == 2
+        and row_stride_ok(x, config)
+        and weight.is_contiguous()
+        and shape_dynamic_skinny_gemm.is_available()
+    ):
+        return shape_dynamic_skinny_gemm(x, weight, config)
+    return torch.nn.functional.linear(x, weight)
+
+
+def _qwen3_5_low_latency_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="qwen3_5_low_latency_gemm",
+    op_func=_qwen3_5_low_latency_gemm,
+    fake_impl=_qwen3_5_low_latency_gemm_fake,
+)
+
+
+def enable_qwen3_5_low_latency_gemm(module: nn.Module, dtype: torch.dtype) -> None:
+    plans = QWEN3_5_GEMM_PLANS_BY_CAPABILITY.get(
+        current_platform.get_device_capability(), {}
+    )
+    if dtype != torch.bfloat16 or not plans:
+        return
+    if not shape_dynamic_skinny_gemm.is_available():
+        return
+
+    warmup_configs: set[SkinnyGemmConfig] = set()
+    for child in module.modules():
+        if not (
+            isinstance(child, LinearBase)
+            and type(child.quant_method) is UnquantizedLinearMethod
+        ):
+            continue
+        weight = getattr(child, "weight", None)
+        if weight is None or weight.dim() != 2:
+            continue
+        plan = plans.get((weight.shape[0], weight.shape[1]))
+        if plan is None:
+            continue
+        child.quant_method = Qwen3_5LowLatencyLinearMethod()
+        warmup_configs.update(plan.values())
+
+    if warmup_configs:
+        shape_dynamic_skinny_gemm.request_warmup_configs(dtype, warmup_configs)
+
+
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
@@ -359,6 +455,8 @@ class Qwen3_5ForCausalLMBase(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+        enable_qwen3_5_low_latency_gemm(self, self.model_config.dtype)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
