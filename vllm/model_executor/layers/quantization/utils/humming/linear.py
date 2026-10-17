@@ -12,15 +12,9 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.utils.humming.schema import (
     check_and_fallback_input_schema,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
     from vllm.utils.humming import BaseInputSchema, LayerConfig
-
-# humming_forward is not traceable by Dynamo (humming 0.1.16 builds DeviceInfo
-# objects inside it), so Humming linears run as an opaque custom op. The op takes
-# a key to look up the layer and its LayerConfig, which can't be op arguments.
-_HUMMING_LAYERS: dict[str, tuple[LinearBase, "LayerConfig"]] = {}
 
 
 def convert_linear_layer_to_humming_standard(
@@ -156,7 +150,6 @@ def prepare_humming_linear_layer_config(
         param = torch.nn.Parameter(tensor, requires_grad=False)
         setattr(layer, name, param)
 
-    _HUMMING_LAYERS[layer.prefix] = (layer, config)
     return config
 
 
@@ -170,63 +163,7 @@ def get_humming_linear_compute_config() -> str:
     )
 
 
-def _humming_linear_op(
-    x: torch.Tensor,
-    key: str,
-    compute_config: str,
-    locks: torch.Tensor,
-    skip_bias_add: bool,
-) -> torch.Tensor:
-    layer, layer_config = _HUMMING_LAYERS[key]
-    return _apply_humming_linear(
-        layer,
-        x,
-        skip_bias_add=skip_bias_add,
-        layer_config=layer_config,
-        compute_config=compute_config,
-        locks=locks,
-    )
-
-
-def _humming_linear_op_fake(
-    x: torch.Tensor,
-    key: str,
-    compute_config: str,
-    locks: torch.Tensor,
-    skip_bias_add: bool,
-) -> torch.Tensor:
-    layer, _ = _HUMMING_LAYERS[key]
-    return x.new_empty((x.shape[0], sum(layer.output_partition_sizes)))
-
-
-direct_register_custom_op(
-    op_name="humming_linear",
-    op_func=_humming_linear_op,
-    fake_impl=_humming_linear_op_fake,
-)
-
-
 def apply_humming_linear(
-    layer: LinearBase,
-    x: torch.Tensor,
-    *,
-    skip_bias_add: bool = False,
-    layer_config: "LayerConfig",
-    compute_config: str,
-    locks: torch.Tensor,
-) -> torch.Tensor:
-    # layer_config is the one registered in prepare_humming_linear_layer_config
-    output = torch.ops.vllm.humming_linear(
-        x.reshape(-1, x.size(-1)),
-        layer.prefix,
-        compute_config,
-        locks,
-        skip_bias_add,
-    )
-    return output.view(*x.shape[:-1], output.size(-1))
-
-
-def _apply_humming_linear(
     layer: LinearBase,
     x: torch.Tensor,
     *,
