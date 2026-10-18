@@ -18,8 +18,16 @@ map to 0). Each row is split into slices:
 4. Every slice writes -inf and the kept logits that fall in it.
 """
 
+from typing import Any
+
 import torch
 
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    DispatchSpec,
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+)
 from vllm.triton_utils import tl, triton
 
 MAX_TOP_K = 64
@@ -88,8 +96,8 @@ def _gather_kernel(
     logits_ptr,
     logits_stride,
     chunk_max_ptr,
-    cand_ptr,
-    num_cand_ptr,
+    candidates_ptr,
+    num_candidates_ptr,
     k_ptr,
     vocab_size,
     slice_size,
@@ -116,9 +124,9 @@ def _gather_kernel(
         token = block + tl.arange(0, BLOCK)
         key = _load_keys(in_row, token, end)
         take = key >= bound
-        slot = tl.atomic_add(num_cand_ptr + row + 0 * token, 1, mask=take)
+        slot = tl.atomic_add(num_candidates_ptr + row + 0 * token, 1, mask=take)
         tl.store(
-            cand_ptr + row * CAPACITY + slot,
+            candidates_ptr + row * CAPACITY + slot,
             _composite(key, token),
             mask=take & (slot < CAPACITY),
         )
@@ -148,8 +156,8 @@ def _kth_key_by_histogram(in_row, vocab_size, top_k, BLOCK: tl.constexpr):
 def _select_kernel(
     logits_ptr,
     logits_stride,
-    cand_ptr,
-    num_cand_ptr,
+    candidates_ptr,
+    num_candidates_ptr,
     kept_ptr,
     num_kept_ptr,
     k_ptr,
@@ -162,10 +170,10 @@ def _select_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     in_row = logits_ptr + row * logits_stride
-    cand_row = cand_ptr + row * CAPACITY
+    cand_row = candidates_ptr + row * CAPACITY
     top_k = tl.load(k_ptr + row)
     top_p = tl.load(p_ptr + row) if USE_TOP_P else 1.0
-    num_cand = tl.load(num_cand_ptr + row)
+    num_cand = tl.load(num_candidates_ptr + row)
     if num_cand > CAPACITY:
         # Too many ties at the bound: find the k-th key exactly and collect
         # the logits above it plus its first copies by token id.
@@ -197,10 +205,12 @@ def _select_kernel(
     prob = tl.where(is_cand, tl.exp(value - row_max), 0.0)
     prob = prob / tl.sum(prob)
     mass_above = tl.cumsum(prob, 0) - prob
-    kept = is_cand & ((top_p >= 1.0) | (mass_above < top_p))
-    # Kept tokens form a prefix of the sorted candidates, at most k long.
-    tl.store(kept_ptr + row * MAX_K + idx, composite, mask=kept & (idx < MAX_K))
-    tl.store(num_kept_ptr + row, tl.sum(kept.to(tl.int32)))
+    keep = is_cand & ((top_p >= 1.0) | (mass_above < top_p))
+    # Keep the leading run, at most k <= MAX_K long: the parallel FP32 cumsum
+    # is not monotone when p is within a few ulps of 1.
+    num_kept = tl.min(tl.where(keep, CAPACITY, idx))
+    tl.store(kept_ptr + row * MAX_K + idx, composite, mask=idx < num_kept)
+    tl.store(num_kept_ptr + row, num_kept)
 
 
 @triton.jit
@@ -232,6 +242,153 @@ def _write_kernel(
     tl.store(out_row + token, value, mask=in_slice)
 
 
+def _slice_size(vocab_size: int) -> int:
+    return triton.cdiv(triton.cdiv(vocab_size, _NUM_SLICES), _BLOCK) * _BLOCK
+
+
+def _num_chunks_pad(vocab_size: int) -> int:
+    return triton.next_power_of_2(triton.cdiv(vocab_size, _CHUNK))
+
+
+def _chunk_max_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    logits_stride: Any = WarmupChoices(16, 2)
+    return dict(
+        logits=TritonWarmupTensor(
+            torch.bfloat16, shape=(1, vocab_size), strides=(logits_stride, 1)
+        ),
+        chunk_max=TritonWarmupTensor(torch.int32),
+    )
+
+
+def _gather_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    logits_stride: Any = WarmupChoices(16, 2)
+    return dict(
+        logits=TritonWarmupTensor(
+            torch.bfloat16, shape=(1, vocab_size), strides=(logits_stride, 1)
+        ),
+        chunk_max=TritonWarmupTensor(torch.int32),
+        candidates=TritonWarmupTensor(torch.int64),
+        num_candidates=TritonWarmupTensor(torch.int32),
+        k=TritonWarmupTensor(torch.int32),
+    )
+
+
+def _select_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    logits_stride: Any = WarmupChoices(16, 2)
+    use_top_p: Any = WarmupChoices(True, False)
+    return dict(
+        logits=TritonWarmupTensor(
+            torch.bfloat16, shape=(1, vocab_size), strides=(logits_stride, 1)
+        ),
+        candidates=TritonWarmupTensor(torch.int64),
+        num_candidates=TritonWarmupTensor(torch.int32),
+        kept=TritonWarmupTensor(torch.int64),
+        num_kept=TritonWarmupTensor(torch.int32),
+        k=TritonWarmupTensor(torch.int32),
+        p=TritonWarmupTensor(torch.float32) if use_top_p else None,
+    )
+
+
+def _write_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    return dict(
+        out=TritonWarmupTensor(torch.float32, shape=(1, vocab_size)),
+        kept=TritonWarmupTensor(torch.int64),
+        num_kept=TritonWarmupTensor(torch.int32),
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_chunk_max_kernel, warmup_inputs=_chunk_max_warmup_inputs
+)
+def _chunk_max(logits: torch.Tensor, chunk_max: torch.Tensor) -> DispatchSpec:
+    num_rows, vocab_size = logits.shape
+    slice_size = _slice_size(vocab_size)
+    return (num_rows, triton.cdiv(vocab_size, slice_size)), dict(
+        vocab_size=vocab_size,
+        slice_size=slice_size,
+        NUM_CHUNKS_PAD=_num_chunks_pad(vocab_size),
+        BLOCK=_BLOCK,
+        CHUNK=_CHUNK,
+        num_warps=4,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_gather_kernel, warmup_inputs=_gather_warmup_inputs
+)
+def _gather(
+    logits: torch.Tensor,
+    chunk_max: torch.Tensor,
+    candidates: torch.Tensor,
+    num_candidates: torch.Tensor,
+    k: torch.Tensor,
+) -> DispatchSpec:
+    num_rows, vocab_size = logits.shape
+    slice_size = _slice_size(vocab_size)
+    return (num_rows, triton.cdiv(vocab_size, slice_size)), dict(
+        vocab_size=vocab_size,
+        slice_size=slice_size,
+        NUM_CHUNKS_PAD=_num_chunks_pad(vocab_size),
+        CAPACITY=_CAPACITY,
+        BLOCK=_BLOCK,
+        CHUNK=_CHUNK,
+        num_warps=4,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_select_kernel, warmup_inputs=_select_warmup_inputs
+)
+def _select(
+    logits: torch.Tensor,
+    candidates: torch.Tensor,
+    num_candidates: torch.Tensor,
+    kept: torch.Tensor,
+    num_kept: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor | None,
+) -> DispatchSpec:
+    num_rows, vocab_size = logits.shape
+    return (num_rows,), dict(
+        p_ptr=k if p is None else p,
+        vocab_size=vocab_size,
+        USE_TOP_P=p is not None,
+        CAPACITY=_CAPACITY,
+        MAX_K=MAX_TOP_K,
+        BLOCK=4096,
+        num_warps=8,
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_write_kernel, warmup_inputs=_write_warmup_inputs
+)
+def _write(
+    out: torch.Tensor, kept: torch.Tensor, num_kept: torch.Tensor
+) -> DispatchSpec:
+    num_rows, vocab_size = out.shape
+    slice_size = _slice_size(vocab_size)
+    return (num_rows, triton.cdiv(vocab_size, slice_size)), dict(
+        vocab_size=vocab_size,
+        slice_size=slice_size,
+        MAX_K=MAX_TOP_K,
+        BLOCK=_BLOCK,
+        num_warps=4,
+    )
+
+
+def register_small_k_warmups() -> None:
+    """Register the kernels of ``apply_top_k_top_p_small_k`` for JIT warmup."""
+    _chunk_max.register_warmup()
+    _gather.register_warmup()
+    _select.register_warmup()
+    _write.register_warmup()
+
+
 def apply_top_k_top_p_small_k(
     logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor | None
 ) -> torch.Tensor:
@@ -244,66 +401,17 @@ def apply_top_k_top_p_small_k(
     if num_rows == 0:
         return out
     k = k.to(torch.int32)
-    num_chunks_pad = triton.next_power_of_2(triton.cdiv(vocab_size, _CHUNK))
-    slice_size = triton.cdiv(triton.cdiv(vocab_size, _NUM_SLICES), _BLOCK) * _BLOCK
-    grid = (num_rows, triton.cdiv(vocab_size, slice_size))
-    chunk_max = torch.empty(num_rows, num_chunks_pad, dtype=torch.int32, device=device)
+    if p is not None:
+        p = p.to(torch.float32)
+    chunk_max = torch.empty(
+        num_rows, _num_chunks_pad(vocab_size), dtype=torch.int32, device=device
+    )
     candidates = torch.empty(num_rows, _CAPACITY, dtype=torch.int64, device=device)
     num_candidates = torch.zeros(num_rows, dtype=torch.int32, device=device)
     kept = torch.empty(num_rows, MAX_TOP_K, dtype=torch.int64, device=device)
     num_kept = torch.empty(num_rows, dtype=torch.int32, device=device)
-
-    _chunk_max_kernel[grid](
-        logits,
-        logits.stride(0),
-        chunk_max,
-        vocab_size,
-        slice_size,
-        NUM_CHUNKS_PAD=num_chunks_pad,
-        BLOCK=_BLOCK,
-        CHUNK=_CHUNK,
-        num_warps=4,
-    )
-    _gather_kernel[grid](
-        logits,
-        logits.stride(0),
-        chunk_max,
-        candidates,
-        num_candidates,
-        k,
-        vocab_size,
-        slice_size,
-        NUM_CHUNKS_PAD=num_chunks_pad,
-        CAPACITY=_CAPACITY,
-        BLOCK=_BLOCK,
-        CHUNK=_CHUNK,
-        num_warps=4,
-    )
-    _select_kernel[(num_rows,)](
-        logits,
-        logits.stride(0),
-        candidates,
-        num_candidates,
-        kept,
-        num_kept,
-        k,
-        k if p is None else p.to(torch.float32),
-        vocab_size,
-        USE_TOP_P=p is not None,
-        CAPACITY=_CAPACITY,
-        MAX_K=MAX_TOP_K,
-        BLOCK=4096,
-        num_warps=8,
-    )
-    _write_kernel[grid](
-        out,
-        out.stride(0),
-        kept,
-        num_kept,
-        vocab_size,
-        slice_size,
-        MAX_K=MAX_TOP_K,
-        BLOCK=_BLOCK,
-        num_warps=4,
-    )
+    _chunk_max(logits, chunk_max)
+    _gather(logits, chunk_max, candidates, num_candidates, k)
+    _select(logits, candidates, num_candidates, kept, num_kept, k, p)
+    _write(out, kept, num_kept)
     return out

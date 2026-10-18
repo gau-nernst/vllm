@@ -75,6 +75,10 @@ def _run_shape_battery(llm: LLM) -> None:
         SamplingParams(
             temperature=0.8, top_k=20, top_p=0.9, min_p=0.1, max_tokens=8, seed=0
         ),
+        # T=1 with only small top-k (and top-p) takes the fused BF16 path in
+        # speculative verification.
+        SamplingParams(temperature=1.0, top_k=20, top_p=0.9, max_tokens=8, seed=0),
+        SamplingParams(temperature=1.0, top_k=20, max_tokens=8, seed=0),
     ):
         llm.generate(medium, sampling_params)
 

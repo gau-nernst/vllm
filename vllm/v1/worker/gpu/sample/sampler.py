@@ -251,17 +251,14 @@ class Sampler:
             not skip_top_k_top_p
             and logits.dtype == torch.bfloat16
             and not np.any(self.needs_value_processing[idx_mapping_np])
+            and np.max(self.sampling_states.top_k.np[idx_mapping_np]) <= SMALL_TOP_K_MAX
         ):
             # Only top-k/top-p apply: mask while casting, in one kernel.
             top_k, top_p, _ = self.sampling_states.get_top_k_top_p(
                 expanded_idx_mapping, idx_mapping_np, logits.shape[-1]
             )
-            if (
-                top_k is not None
-                and np.max(self.sampling_states.top_k.np[idx_mapping_np])
-                <= SMALL_TOP_K_MAX
-            ):
-                return apply_top_k_top_p_small_k(logits, top_k, top_p)
+            assert top_k is not None
+            return apply_top_k_top_p_small_k(logits, top_k, top_p)
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)

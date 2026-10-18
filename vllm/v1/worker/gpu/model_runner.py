@@ -485,9 +485,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 from vllm.v1.sample.ops.topk_topp_sampler import (
                     register_top_k_top_p_warmups,
                 )
+                from vllm.v1.sample.ops.topk_topp_small_k import (
+                    register_small_k_warmups,
+                )
 
                 with self.jit_warmup_registry.activate():
                     register_top_k_top_p_warmups()
+                    if self.speculative_config is not None:
+                        register_small_k_warmups()
 
             sampler_kwargs: dict[str, Any] = {
                 "vllm_config": self.vllm_config,
