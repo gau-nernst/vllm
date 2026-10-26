@@ -27,6 +27,9 @@ class PPTransport(ABC):
 
     # Bytes this transport holds that memory profiling does not count.
     unprofiled_bytes: int = 0
+    # The forward may read received tensors where they are (eager steps), since
+    # they stay valid until the next before_forward.
+    recv_in_place: bool = False
 
     def before_forward(self) -> None:  # noqa: B027
         """Called before each forward pass, which may overwrite the previous
@@ -60,7 +63,15 @@ def create_pp_transport(
     from vllm.distributed.pp_transport.nccl import NcclTransport
 
     mode = envs.VLLM_PP_TRANSPORT
-    if mode != "nccl":
+    if mode == "sdma":
+        from vllm.distributed.pp_transport.sdma import SdmaTransport
+
+        sdma, reason = SdmaTransport.create(vllm_config, get_pp_group(), persistent)
+        if sdma is None:
+            raise RuntimeError(f"VLLM_PP_TRANSPORT=sdma is not usable here: {reason}")
+        logger.info_once("PP transport: SDMA engines")
+        return sdma
+    if mode in ("auto", "copy_engine"):
         from vllm.distributed.pp_transport.copy_engine import CopyEngineTransport
 
         transport, reason = CopyEngineTransport.create(

@@ -145,7 +145,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
-from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm.v1.worker.gpu.pp_utils import PPHandler, stage_intermediate_tensors
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
     all_to_all_vocab_shards,
@@ -250,6 +250,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # The profile run's outputs (non-last PP ranks): the largest PP send,
         # which sizes the PP transport's buffers.
         self.profile_pp_send: IntermediateTensors | None = None
+        # Set by the worker when the PP transport keeps received tensors valid
+        # until the step has run, so eager steps read them in place.
+        self.pp_recv_in_place = False
 
         # Dual batch overlap. Created in initialize_kv_cache(), once everything
         # it runs the microbatched forward with exists.
@@ -2062,14 +2065,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
             n = input_batch.num_tokens_after_padding
-            received = intermediate_tensors.tensors
-            new_tensors = {
-                k: v[:n]
-                # Some PP transports receive into the persistent buffer.
-                if dummy_run or received[k].data_ptr() == v.data_ptr()
-                else v[:n].copy_(received[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
-            }
+            persistent = self.intermediate_tensors.tensors
+            if dummy_run:
+                new_tensors = {k: v[:n] for k, v in persistent.items()}
+            else:
+                new_tensors = stage_intermediate_tensors(
+                    persistent,
+                    intermediate_tensors.tensors,
+                    n,
+                    in_place=self.pp_recv_in_place
+                    and batch_desc.cg_mode == CUDAGraphMode.NONE
+                    and ubatch_state is None,
+                )
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
             del intermediate_tensors
 

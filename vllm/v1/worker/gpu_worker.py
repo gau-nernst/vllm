@@ -632,6 +632,8 @@ class Worker(WorkerBase):
             None if persistent is None else persistent.tensors,
             None if profile_send is None else profile_send.tensors,
         )
+        if self._pp_transport.recv_in_place:
+            self.model_runner.pp_recv_in_place = True  # type: ignore[attr-defined]
         if profile_send is not None:
             # Free the profile run's outputs before memory profiling measures.
             profile_send.tensors.clear()

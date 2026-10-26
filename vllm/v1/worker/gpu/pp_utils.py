@@ -35,6 +35,36 @@ class PendingRecv:
     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
 
 
+def stage_intermediate_tensors(
+    persistent: dict[str, torch.Tensor],
+    received: dict[str, torch.Tensor],
+    num_tokens: int,
+    in_place: bool,
+) -> dict[str, torch.Tensor]:
+    """The first ``num_tokens`` rows of a non-first PP rank's received tensors,
+    as the forward reads them. The persistent buffers give CUDA graphs and
+    microbatches fixed addresses; with ``in_place`` (an eager step) the received
+    tensors are read where they are unless one does not match its buffer."""
+    in_place = (
+        in_place
+        and received.keys() == persistent.keys()
+        and all(
+            received[k].shape[0] >= num_tokens
+            and received[k].shape[1:] == v.shape[1:]
+            and received[k].dtype == v.dtype
+            and received[k].device == v.device
+            for k, v in persistent.items()
+        )
+    )
+    return {
+        k: received[k][:num_tokens]
+        # Some PP transports receive into the persistent buffer.
+        if in_place or received[k].data_ptr() == v.data_ptr()
+        else v[:num_tokens].copy_(received[k][:num_tokens])
+        for k, v in persistent.items()
+    }
+
+
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
     with outputs that might be needed in a subsequent (decode) step.

@@ -166,3 +166,42 @@ def test_finishing_prefill_row_does_not_drop_a_sibling_row():
 
     assert mask is not None
     assert mask.tolist() == [False, True]
+
+
+def _received(n_rows):
+    import torch
+
+    return {
+        "hidden_states": torch.randn(n_rows, 8),
+        "residual": torch.randn(n_rows, 8),
+        "aux_hidden_states_0": torch.randn(n_rows, 8),
+    }
+
+
+def test_eager_step_reads_received_tensors_in_place():
+    """An eager step skips the copy into the persistent buffers: the forward gets
+    views of the received tensors, the buffers keep their contents."""
+    import torch
+
+    persistent = {k: torch.zeros(32, 8) for k in _received(1)}
+    received = _received(12)
+    staged = pp_utils.stage_intermediate_tensors(persistent, received, 10, True)
+    for k, v in staged.items():
+        assert v.data_ptr() == received[k].data_ptr() and v.shape == (10, 8)
+        assert torch.equal(v, received[k][:10])
+        assert torch.count_nonzero(persistent[k]) == 0
+
+
+def test_graph_step_or_mismatch_copies_into_persistent_buffers():
+    """Graphs / microbatches (in_place False) and any layout mismatch keep the
+    copy into the persistent buffers."""
+    import torch
+
+    received = _received(12)
+    mismatched = dict(received, residual=received["residual"].double())
+    for in_place, recv in ((False, received), (True, mismatched)):
+        persistent = {k: torch.zeros(32, 8) for k in received}
+        staged = pp_utils.stage_intermediate_tensors(persistent, recv, 10, in_place)
+        for k, v in staged.items():
+            assert v.data_ptr() == persistent[k].data_ptr()
+            assert torch.equal(v, recv[k][:10].to(v.dtype))
