@@ -659,11 +659,14 @@ class Worker(WorkerBase):
         if not self.use_v2_model_runner or self._pp_send_buffer is not None:
             return 0
         nbytes = getattr(self.model_runner, "profile_pp_send_bytes", 0)
-        if nbytes == 0:
+        # Eval only: 0 keeps upstream's wait before the forward.
+        depth = int(os.environ.get("VLLM_PP_SEND_BUFFER_DEPTH", "1"))
+        if nbytes == 0 or depth == 0:
             return 0
         free_before, _ = torch.accelerator.get_memory_info(self.device)
         with self._maybe_get_memory_pool_context("workspace"):
-            self._pp_send_buffer = PPSendBuffer(nbytes, self.device)
+            self._pp_send_buffer = PPSendBuffer(nbytes, self.device, depth)
+        logger.info("PP send buffer: depth %d, %d bytes each", depth, nbytes)
         free_after, _ = torch.accelerator.get_memory_info(self.device)
         return free_before - free_after
 

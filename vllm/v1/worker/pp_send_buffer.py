@@ -37,9 +37,14 @@ def packed_nbytes(tensors: dict[str, Any]) -> int:
 
 
 class PPSendBuffer:
-    def __init__(self, nbytes: int, device: torch.device) -> None:
-        self.buffer = torch.empty(nbytes, dtype=torch.uint8, device=device)
-        self._send_work: list[Handle] = []
+    def __init__(self, nbytes: int, device: torch.device, depth: int = 1) -> None:
+        # Eval only: depth > 1 rotates through that many buffers.
+        self.buffers = [
+            torch.empty(nbytes, dtype=torch.uint8, device=device) for _ in range(depth)
+        ]
+        self.buffer = self.buffers[0]
+        self._works: list[list[Handle]] = [[] for _ in range(depth)]
+        self._slot = 0
 
     def send(
         self,
@@ -61,7 +66,10 @@ class PPSendBuffer:
             )
         # The previous snapshot's sends must have read the buffer. This is a
         # stream wait, so the CPU keeps going.
-        for handle in self._send_work:
+        i = self._slot
+        self._slot = (i + 1) % len(self.buffers)
+        buffer = self.buffers[i]
+        for handle in self._works[i]:
             handle.wait()
         staged: dict[str, Any] = {}
         for key, value in tensors.items():
@@ -69,9 +77,9 @@ class PPSendBuffer:
                 staged[key] = value
                 continue
             start = offsets[key]
-            view = self.buffer[start : start + value.nbytes]
+            view = buffer[start : start + value.nbytes]
             staged[key] = view.view(value.dtype).view(value.shape)
             staged[key].copy_(value)
         handles = pp_group.isend_tensor_dict(staged, all_gather_group=all_gather_group)
         # The metadata handle is reaped by the group coordinator.
-        self._send_work = handles[1:]
+        self._works[i] = handles[1:]
