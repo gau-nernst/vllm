@@ -1187,9 +1187,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
+        # Uninitialized: _forward_core writes rows [:num_actual_tokens] and
+        # zeroes the CUDA graph padding rows behind them (see #28182 for why
+        # those rows must not hold garbage).
+        core_attn_out = torch.empty(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -1577,9 +1578,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
             self._warmup_prefill_kernels(mixed_qkv, 0)
+            core_attn_out.zero_()
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+
+        # Padding rows exist when a piecewise CUDA graph replays a smaller
+        # batch. FULL graph decode pads num_actual_tokens itself, so every
+        # row is assigned below.
+        if core_attn_out.shape[0] > attn_metadata.num_actual_tokens:
+            core_attn_out[attn_metadata.num_actual_tokens :].zero_()
 
         if (
             self.enable_packed_recurrent_decode
