@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -17,11 +18,14 @@ def _fused_sigmoid_gate_mul_kernel(
     gate_stride_t,
     out_stride_t,
     BLOCK: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < hidden
 
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     x = tl.load(x_ptr + row * x_stride_t + offs, mask=mask, other=0.0)
     g = tl.load(gate_ptr + row * gate_stride_t + offs, mask=mask, other=0.0)
     out = x.to(tl.float32) * tl.sigmoid(g.to(tl.float32))
@@ -30,6 +34,8 @@ def _fused_sigmoid_gate_mul_kernel(
         out.to(out_ptr.dtype.element_ty),
         mask=mask,
     )
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_sigmoid_gate_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -82,5 +88,6 @@ def fused_sigmoid_gate_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         out.stride(0),
         BLOCK=block,
         num_warps=num_warps,
+        launch_pdl=current_platform.is_arch_support_pdl(),
     )
     return out

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     calc_rows_per_block,
 )
@@ -24,6 +25,7 @@ def _fused_gdn_gated_rms_norm_kernel(
     ROWS_PER_BLOCK: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
     """FLA-equivalent per-head gated RMS norm with token-strided z."""
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -38,6 +40,8 @@ def _fused_gdn_gated_rms_norm_kernel(
     x_ptrs = x_ptr + rows[:, None] * stride_x_tok + head * N + cols[None, :]
     z_ptrs = z_ptr + rows[:, None] * stride_z_tok + head * N + cols[None, :]
 
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if not NORM_BEFORE_GATE:
@@ -63,6 +67,8 @@ def _fused_gdn_gated_rms_norm_kernel(
 
     out_ptrs = out_ptr + rows[:, None] * stride_out_tok + head * N + cols[None, :]
     tl.store(out_ptrs, y.to(out_ptr.dtype.element_ty), mask=mask)
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_gdn_gated_rms_norm(
@@ -104,6 +110,10 @@ def fused_gdn_gated_rms_norm(
     block_n = triton.next_power_of_2(head_v_dim)
     rows_per_block = calc_rows_per_block(num_tokens, x.device)
     grid = (triton.cdiv(num_tokens, rows_per_block), num_v_heads)
+    # PDL-armed blocks pay ~0.3-0.5 us per 1k blocks of launch-path cost on
+    # GB300 even when the producer never triggers early (measured +3 us/call
+    # at 6144 blocks, B=128 decode), so restrict PDL to small grids.
+    launch_pdl = current_platform.is_arch_support_pdl() and grid[0] * grid[1] <= 2048
     _fused_gdn_gated_rms_norm_kernel[grid](
         x,
         z,
@@ -120,4 +130,5 @@ def fused_gdn_gated_rms_norm(
         NORM_BEFORE_GATE=norm_before_gate,
         ACTIVATION=activation,
         num_warps=min(max(block_n // 256, 1), 8),
+        launch_pdl=launch_pdl,
     )

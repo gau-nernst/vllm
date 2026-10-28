@@ -10,6 +10,7 @@ single Triton launch. See :func:`fused_qk_rmsnorm_rope_gate`.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -46,6 +47,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     HAS_MROPE: tl.constexpr,
     MROPE_SECTION_H: tl.constexpr,
     MROPE_SECTION_W: tl.constexpr,
+    launch_pdl: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -64,6 +66,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     # --- RMSNorm: variance over the full head_dim ---
     head_offs = tl.arange(0, HEAD_BLOCK)
     head_mask = head_offs < head_dim
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
     x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / head_dim
     inv_rms = tl.rsqrt(var + eps)
@@ -133,6 +137,9 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
         gate_out_base = gate_out_ptr + token * gate_out_stride_t + local_head * head_dim
         g = tl.load(gate_in_base + head_offs, mask=head_mask, other=0.0)
         tl.store(gate_out_base + head_offs, g, mask=head_mask)
+
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def fused_qk_rmsnorm_rope_gate(
@@ -241,6 +248,10 @@ def fused_qk_rmsnorm_rope_gate(
     num_warps = max(1, head_block // 64)
 
     grid = (n_tokens, num_q_heads + num_kv_heads)
+    # PDL-armed blocks pay ~0.3-0.5 us per 1k blocks of launch-path cost on
+    # GB300, and prelaunch spin contends with the producer GEMM; net loss at
+    # B=128 decode (3584 blocks), so restrict PDL to small grids.
+    launch_pdl = current_platform.is_arch_support_pdl() and grid[0] * grid[1] <= 2048
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,
@@ -275,5 +286,6 @@ def fused_qk_rmsnorm_rope_gate(
         MROPE_SECTION_W=mrope_section_w,
         num_warps=num_warps,
         num_stages=2,
+        launch_pdl=launch_pdl,
     )
     return q_out, k_out, gate_out
