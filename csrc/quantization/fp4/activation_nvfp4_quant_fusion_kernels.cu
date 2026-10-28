@@ -35,8 +35,15 @@
 namespace vllm {
 
 // Use UE4M3 by default.
+//
+// Work item i = row * num_packed_cols + col is one CVT_FP4_ELTS_PER_THREAD
+// chunk of a row. Threads walk all numRows * num_packed_cols items with a flat
+// grid-stride loop, so every launched thread has work for any shape (a rows x
+// column-blocks grid idles the threads of a partial last column block). The
+// host launches at most one full wave, so the initial index and the stride fit
+// in 32 bits; the running index is 64-bit.
 template <class Type, bool UE8M0_SF = false>
-__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
+__global__ void __launch_bounds__(256, VLLM_BLOCKS_PER_SM(256))
     silu_mul_cvt_fp16_to_fp4(int32_t numRows, int32_t numCols,
                              int32_t num_packed_cols,
                              Type const* __restrict__ in,
@@ -49,6 +56,14 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
   static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
                 "Vec size is not matched.");
 
+  // Programmatic dependent launch, as in cvt_fp16_to_fp4: wait for the
+  // producer of `in`, then let the consumer (which synchronizes on its own)
+  // launch while this grid is still running.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
   // Precompute SF layout parameter (constant for entire kernel).
   int32_t const numKTiles = (numCols + 63) / 64;
 
@@ -57,60 +72,56 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
   // (448.f / (Alpha_A / 6.f)).
   float const SFScaleVal = (SFScale == nullptr) ? 1.0f : SFScale[0];
 
-  int32_t const colIdx = blockDim.x * blockIdx.y + threadIdx.x;
-  int elem_idx = colIdx * CVT_FP4_ELTS_PER_THREAD;
+  int64_t const numItems = int64_t(numRows) * num_packed_cols;
+  uint32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t const stride = gridDim.x * blockDim.x;
+  // Decompose once, then advance (row, col) by the stride with a carry.
+  int32_t rowIdx = tid / num_packed_cols;
+  int32_t colIdx = tid % num_packed_cols;
+  int32_t const rowStep = stride / num_packed_cols;
+  int32_t const colStep = stride % num_packed_cols;
 
-  // Input tensor row/col loops.
-  for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
-    if (colIdx < num_packed_cols) {
-      PackedVec in_vec;
-      PackedVec in_vec2;
-      int64_t inOffset =
-          rowIdx * (numCols * 2 / CVT_FP4_ELTS_PER_THREAD) + colIdx;
-      int64_t inOffset2 = rowIdx * (numCols * 2 / CVT_FP4_ELTS_PER_THREAD) +
-                          numCols / CVT_FP4_ELTS_PER_THREAD + colIdx;
+  for (int64_t idx = tid; idx < numItems; idx += stride) {
+    Type const* gate =
+        in + int64_t(rowIdx) * 2 * numCols + colIdx * CVT_FP4_ELTS_PER_THREAD;
+    PackedVec in_vec;
+    PackedVec in_vec2;
+    // Every loop item is in range: the predicates fold away, leaving plain
+    // .cg loads.
+    if constexpr (CVT_FP4_PACK16) {
+      ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec), gate, true);
+      ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec2), gate + numCols,
+                       true);
+    } else {
+      ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec), gate, true);
+      ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec2), gate + numCols, true);
+    }
 
-      bool valid = (rowIdx < numRows) && (elem_idx < numCols);
-      if constexpr (CVT_FP4_PACK16) {
-        ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 8],
-                         valid);
-        ld256_cg_or_zero(reinterpret_cast<u32x8_t&>(in_vec2),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset2 * 8],
-                         valid);
-      } else {
-        ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset * 4],
-                         valid);
-        ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec2),
-                         &reinterpret_cast<const uint32_t*>(in)[inOffset2 * 4],
-                         valid);
-      }
+    // Compute silu and mul
+    PackedVec out_silu_mul = compute_silu_mul<Type>(in_vec, in_vec2);
 
-      // Compute silu and mul
-      PackedVec out_silu_mul = compute_silu_mul<Type>(in_vec, in_vec2);
+    auto sf_out =
+        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                           CVT_FP4_NUM_THREADS_PER_SF>(
+            rowIdx, colIdx, numKTiles, SFout);
 
-      auto sf_out =
-          cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
-                                             CVT_FP4_NUM_THREADS_PER_SF>(
-              rowIdx, colIdx, numKTiles, SFout);
+    auto out_val =
+        cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+            out_silu_mul, SFScaleVal, sf_out);
 
-      auto out_val =
-          cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
-              out_silu_mul, SFScaleVal, sf_out);
+    // The output is [numRows, num_packed_cols] chunks, row-major: item idx.
+    if constexpr (CVT_FP4_PACK16) {
+      reinterpret_cast<uint64_t*>(out)[idx] =
+          (uint64_t(out_val.hi) << 32) | uint64_t(out_val.lo);
+    } else {
+      out[idx] = out_val;
+    }
 
-      if (valid) {
-        if constexpr (CVT_FP4_PACK16) {
-          int64_t outOffset = rowIdx * (numCols / 8) + colIdx * 2;
-          uint64_t packed64 =
-              (uint64_t(out_val.hi) << 32) | uint64_t(out_val.lo);
-          reinterpret_cast<uint64_t*>(out)[outOffset >> 1] = packed64;
-        } else {
-          int64_t outOffset =
-              rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
-          out[outOffset] = out_val;
-        }
-      }
+    rowIdx += rowStep;
+    colIdx += colStep;
+    if (colIdx >= num_packed_cols) {
+      colIdx -= num_packed_cols;
+      rowIdx++;
     }
   }
 }
@@ -140,24 +151,47 @@ void silu_and_mul_nvfp4_quant_sm1xxa(
   const torch::stable::accelerator::DeviceGuard device_guard(
       input.get_device_index());
   auto stream = get_current_cuda_stream(input.get_device_index());
-  dim3 block(std::min(int(n / ELTS_PER_THREAD), 512));
-  int const numBlocksPerSM =
-      vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
 
   int num_packed_cols = int(n / CVT_FP4_ELTS_PER_THREAD);
+  int64_t const num_items = int64_t(m) * num_packed_cols;
+  if (num_items == 0) return;
+  constexpr int kBlockSize = 256;
 
-  int grid_y = vllm::div_round_up(num_packed_cols, static_cast<int>(block.x));
-  int grid_x = std::min(
-      int(m), std::max(1, (multiProcessorCount * numBlocksPerSM) / grid_y));
-  dim3 grid(grid_x, grid_y);
+  // PDL lets this grid launch while the producer GEMM is still running. That
+  // pays for small inputs, but above ~4096 items per SM the early blocks slow
+  // the chain down (measured in the gate_up -> act+quant -> down chain).
+  bool const use_pdl = num_items <= int64_t(multiProcessorCount) * 4096;
 
   VLLM_STABLE_DISPATCH_HALF_TYPES(
       input.scalar_type(), "silu_and_mul_nvfp4_quant_kernel", [&] {
         using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
         auto input_ptr = static_cast<cuda_type const*>(input.data_ptr());
-        vllm::silu_mul_cvt_fp16_to_fp4<cuda_type><<<grid, block, 0, stream>>>(
-            m, n, num_packed_cols, input_ptr, input_sf_ptr,
-            reinterpret_cast<uint32_t*>(output_ptr),
-            reinterpret_cast<uint32_t*>(sf_out));
+        auto kernel = vllm::silu_mul_cvt_fp16_to_fp4<cuda_type>;
+        static int const blocks_per_sm = [&] {
+          int blocks = 0;
+          STD_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &blocks, kernel, kBlockSize, 0));
+          return std::max(blocks, 1);
+        }();
+
+        // At most one full wave; larger inputs loop. (Splitting the items
+        // evenly over fewer blocks was slower just above one wave.)
+        int64_t const num_blocks =
+            std::min(vllm::div_round_up<int64_t>(num_items, kBlockSize),
+                     int64_t(multiProcessorCount) * blocks_per_sm);
+
+        cudaLaunchConfig_t config = {};
+        config.gridDim = dim3(num_blocks);
+        config.blockDim = dim3(kBlockSize);
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attrs;
+        config.numAttrs = use_pdl ? 1 : 0;
+        cudaLaunchKernelEx(&config, kernel, m, n, num_packed_cols, input_ptr,
+                           input_sf_ptr,
+                           reinterpret_cast<uint32_t*>(output_ptr),
+                           reinterpret_cast<uint32_t*>(sf_out));
       });
 }
