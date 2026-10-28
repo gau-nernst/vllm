@@ -73,3 +73,52 @@ def test_fused_sigmoid_gate_mul_fallback_noncontiguous():
     expected = x * torch.sigmoid(gate)
 
     torch.testing.assert_close(result, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="PDL is CUDA-only")
+@pytest.mark.parametrize("num_tokens", [1, 128, 2048])
+@torch.inference_mode()
+def test_fused_sigmoid_gate_mul_pdl_graph_bitwise(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+):
+    """Behind a producer in one CUDA graph, PDL on and off give bitwise equal
+    outputs."""
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens)
+    x_in = torch.randn(
+        num_tokens, 6144, dtype=torch.bfloat16, device="cuda", generator=gen
+    )
+    gate = torch.randn(
+        num_tokens, 6144, dtype=torch.bfloat16, device="cuda", generator=gen
+    )
+
+    def run() -> torch.Tensor:
+        x = torch.empty_like(x_in)
+
+        def step():
+            x.copy_(x_in)
+            return fused_sigmoid_gate_mul(x, gate)
+
+        step()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = step()
+        graph.replay()
+        torch.accelerator.synchronize()
+        return out
+
+    pdl_on = run()
+    monkeypatch.setattr(current_platform, "is_arch_support_pdl", lambda: False)
+    torch.testing.assert_close(pdl_on, run(), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="PDL is CUDA-only")
+@torch.inference_mode()
+def test_fused_sigmoid_gate_mul_torch_compile_fullgraph():
+    """The PDL decision must not graph-break a fullgraph torch.compile."""
+    compiled = torch.compile(fused_sigmoid_gate_mul, fullgraph=True, dynamic=True)
+    for num_tokens in (3, 37):
+        x = torch.randn(num_tokens, 4096, dtype=torch.bfloat16, device="cuda")
+        gate = torch.randn(num_tokens, 4096, dtype=torch.bfloat16, device="cuda")
+        torch.testing.assert_close(
+            compiled(x, gate), fused_sigmoid_gate_mul(x, gate), rtol=0, atol=0
+        )

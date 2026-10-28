@@ -13,6 +13,11 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+# Largest grid (in blocks) launched with PDL. Larger grids lose on GB300:
+# prelaunched blocks contend with the producer GEMM and PDL-armed launches of a
+# few thousand blocks cost ~0.3-0.5 us per 1k blocks (net loss at 3584 blocks).
+_PDL_MAX_BLOCKS = 2048
+
 
 @triton.jit
 def _fused_qk_rmsnorm_rope_gate_kernel(
@@ -248,10 +253,14 @@ def fused_qk_rmsnorm_rope_gate(
     num_warps = max(1, head_block // 64)
 
     grid = (n_tokens, num_q_heads + num_kv_heads)
-    # PDL-armed blocks pay ~0.3-0.5 us per 1k blocks of launch-path cost on
-    # GB300, and prelaunch spin contends with the producer GEMM; net loss at
-    # B=128 decode (3584 blocks), so restrict PDL to small grids.
-    launch_pdl = current_platform.is_arch_support_pdl() and grid[0] * grid[1] <= 2048
+    # Traced callers (Qwen3-Next under torch.compile) keep the plain launch:
+    # Dynamo cannot trace the cached platform query, and the token-count gate
+    # would become a shape guard.
+    launch_pdl = (
+        not torch.compiler.is_compiling()
+        and current_platform.is_arch_support_pdl()
+        and grid[0] * grid[1] <= _PDL_MAX_BLOCKS
+    )
     _fused_qk_rmsnorm_rope_gate_kernel[grid](
         q_gate,
         k,

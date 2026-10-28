@@ -88,6 +88,10 @@ def fused_sigmoid_gate_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         out.stride(0),
         BLOCK=block,
         num_warps=num_warps,
-        launch_pdl=current_platform.is_arch_support_pdl(),
+        # Dynamo cannot trace the cached platform query; traced callers keep
+        # the plain launch.
+        launch_pdl=(
+            not torch.compiler.is_compiling() and current_platform.is_arch_support_pdl()
+        ),
     )
     return out

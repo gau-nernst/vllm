@@ -8,6 +8,12 @@ from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
 )
 from vllm.triton_utils import tl, triton
 
+# Largest grid (in blocks) launched with PDL. Larger PDL-armed grids are a net
+# loss in the Qwen3.8-27B decode graph on GB300 (+17 us/step at 1920 blocks,
+# B=40 TP1; +3 us/call at 6144 blocks) even behind the early-triggering
+# packed decode kernel.
+_PDL_MAX_BLOCKS = 1536
+
 
 @triton.jit(do_not_specialize=["M"])
 def _fused_gdn_gated_rms_norm_kernel(
@@ -110,10 +116,9 @@ def fused_gdn_gated_rms_norm(
     block_n = triton.next_power_of_2(head_v_dim)
     rows_per_block = calc_rows_per_block(num_tokens, x.device)
     grid = (triton.cdiv(num_tokens, rows_per_block), num_v_heads)
-    # PDL-armed blocks pay ~0.3-0.5 us per 1k blocks of launch-path cost on
-    # GB300 even when the producer never triggers early (measured +3 us/call
-    # at 6144 blocks, B=128 decode), so restrict PDL to small grids.
-    launch_pdl = current_platform.is_arch_support_pdl() and grid[0] * grid[1] <= 2048
+    launch_pdl = (
+        current_platform.is_arch_support_pdl() and grid[0] * grid[1] <= _PDL_MAX_BLOCKS
+    )
     _fused_gdn_gated_rms_norm_kernel[grid](
         x,
         z,

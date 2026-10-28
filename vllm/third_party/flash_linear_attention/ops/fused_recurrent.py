@@ -15,6 +15,12 @@ from vllm.triton_utils import tl, triton
 
 from .op import exp, log
 
+# Largest packed-decode grid (in blocks) launched with PDL. Prelaunched blocks
+# spin in gdc_wait while the conv1d producer still runs; at large grids they
+# starve it (GB300: conv1d +0.5 us/call at 98k blocks), so larger grids launch
+# without PDL.
+_PACKED_DECODE_PDL_MAX_BLOCKS = 32768
+
 
 @triton.heuristics(
     {
@@ -297,8 +303,10 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
-        # Trigger early so the gated-norm consumer prelaunches and spins in its
-        # own gdc_wait; it is the only PDL consumer of this kernel's outputs.
+        # Trigger early (as fused_norm_gate does): a trigger after the stores
+        # starts the consumer later than a plain launch. Safe because every
+        # consumer either launches without PDL or calls gdc_wait, which waits
+        # for this whole grid to finish, before reading o / ht.
         tl.extra.cuda.gdc_launch_dependents()
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
@@ -480,11 +488,9 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     # CUDA limits grid Y/Z dimensions to 65535.
     split_batch_head_grid = B * HV > 65535
     grid = (NV, HV, B) if split_batch_head_grid else (NV, B * HV)
-    # PDL prelaunches this kernel's blocks into the still-running conv1d
-    # producer; at large grids the spinning blocks starve conv1d (measured
-    # +0.5 us/call at B=128, GB300), so restrict PDL to small grids.
     launch_pdl = (
-        current_platform.is_arch_support_pdl() and NV * B * HV <= 32768
+        current_platform.is_arch_support_pdl()
+        and NV * B * HV <= _PACKED_DECODE_PDL_MAX_BLOCKS
     )
     fused_recurrent_gated_delta_rule_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
