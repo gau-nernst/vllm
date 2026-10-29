@@ -84,8 +84,12 @@ __launch_bounds__(kThreadsPerBlock) silu_and_mul_per_block_quant_kernel(
   for (int k = 0; k < EPT; ++k) {
     float gate = static_cast<float>(gate_v.v[k]);
     float up = static_cast<float>(up_v.v[k]);
+#ifndef USE_ROCM
+    float silu_gate = __fdividef(gate, 1.0f + __expf(-gate));
+#else
     float sigmoid_gate = 1.0f / (1.0f + expf(-gate));
     float silu_gate = gate * sigmoid_gate;
+#endif
     result[k] = silu_gate * up;
     thread_max = fmaxf(thread_max, fabsf(result[k]));
   }
@@ -111,10 +115,24 @@ __launch_bounds__(kThreadsPerBlock) silu_and_mul_per_block_quant_kernel(
     scalar_out_t q[EPT];
   };
   OutVec out_v;
+#ifndef USE_ROCM
+  // One reciprocal per group and a hardware conversion. This can differ from
+  // the per-element divide below by one fp8 step.
+  if constexpr (std::is_same_v<scalar_out_t, c10::Float8_e4m3fn>) {
+    float const inv_scale = 1.0f / group_scale;
+  #pragma unroll
+    for (int k = 0; k < EPT; ++k) {
+      out_v.q[k] = fp8::vec_conversion<c10::Float8_e4m3fn>(
+          fmaxf(-quant_range, fminf(result[k] * inv_scale, quant_range)));
+    }
+  } else
+#endif
+  {
 #pragma unroll
-  for (int k = 0; k < EPT; ++k) {
-    out_v.q[k] = vllm::ScaledQuant<scalar_out_t, false>::quant_fn(result[k],
-                                                                  group_scale);
+    for (int k = 0; k < EPT; ++k) {
+      out_v.q[k] = vllm::ScaledQuant<scalar_out_t, false>::quant_fn(
+          result[k], group_scale);
+    }
   }
   *reinterpret_cast<OutVec*>(token_output) = out_v;
 }
