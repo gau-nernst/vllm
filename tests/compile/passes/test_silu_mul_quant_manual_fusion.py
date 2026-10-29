@@ -19,11 +19,15 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.model_executor.kernels.linear import (
+    CutlassFp8BlockScaledMMKernel,
     CutlassFP8ScaledMMLinearKernel,
     FlashInferFP8ScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
     PerTensorTorchFP8ScaledMMLinearKernel,
     ROCmFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearLayerConfig,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fusion.fused_act_quant import (
@@ -37,6 +41,7 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
+    kFp8Static128BlockSym,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
@@ -210,6 +215,77 @@ def test_manual_fusion_fp8_dynamic_128(dtype: torch.dtype):
             result_unfused,
             atol=5e-2,
             rtol=5e-2,
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 33, 256])
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not CutlassFp8BlockScaledMMKernel.is_supported()[0],
+    reason="CUTLASS block FP8 not supported",
+)
+def test_manual_fusion_fp8_dynamic_128_cutlass(num_tokens: int):
+    """The fused producer matches CUTLASS block FP8's own input quant, and the
+    kernel consumes a pre-quantized input exactly like its own."""
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(0)
+    n, k = 512, 1024
+    config = FP8ScaledMMLinearLayerConfig(
+        activation_quant_key=kFp8Dynamic128Sym,
+        weight_quant_key=kFp8Static128BlockSym,
+        weight_shape=(n, k),
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+    with set_current_vllm_config(
+        VllmConfig(compilation_config=CompilationConfig(custom_ops=["none"]))
+    ):
+        kernel = CutlassFp8BlockScaledMMKernel(config)
+        layer = torch.nn.Module()
+        weight = torch.randn(n, k, generator=g) / k**0.5
+        layer.weight = torch.nn.Parameter(
+            weight.to(current_platform.fp8_dtype()), requires_grad=False
+        )
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.rand(n // 128, k // 128, generator=g, dtype=torch.float32) + 0.5,
+            requires_grad=False,
+        )
+        layer.input_scale = None
+        kernel.process_weights_after_loading(layer)
+        expose_input_quant_key(layer, kernel)
+
+        silu_and_mul = SiluAndMul()
+        x = torch.randn(num_tokens, 2 * k, generator=g)
+        fused = maybe_fused_act_quant(silu_and_mul, x, layer)
+        assert isinstance(fused, QuantizedActivation)
+        y = silu_and_mul(x)
+        q_ref, s_ref = kernel.quant_fp8(y, None, None)
+
+        # Producer vs the kernel's own quant. Codes can move by one FP8 step:
+        # the fused kernel keeps silu*mul in fp32, the chain rounds it to bf16.
+        codes = []
+        for q in (fused.data, q_ref):
+            b = q.view(torch.uint8).to(torch.int32)
+            codes.append(torch.where(b >= 128, 128 - b, b))  # +0 == -0
+        code_dist = (codes[0] - codes[1]).abs()
+        assert code_dist.max().item() <= 1
+        assert (code_dist > 0).float().mean().item() < 0.05
+        scale = fused.scale.view(-1, fused.scale.shape[-1])
+        if num_tokens > 1:  # strides of a size-1 dim are arbitrary
+            assert scale.stride() == s_ref.stride()
+        torch.testing.assert_close(scale, s_ref, rtol=1e-2, atol=0)
+
+        # Consumer: a pre-quantized input gives exactly the in-kernel quant result.
+        qa_ref = QuantizedActivation(
+            data=q_ref,
+            scale=s_ref,
+            orig_dtype=torch.bfloat16,
+            orig_shape=y.shape,
+            quant_key=kFp8Dynamic128Sym,
+        )
+        assert torch.equal(
+            kernel.apply_weights(layer, qa_ref), kernel.apply_weights(layer, y)
         )
 
 

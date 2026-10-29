@@ -71,7 +71,11 @@ def _silu_and_mul_fp8_dynamic_block(
     num_groups = d // group_size
 
     result = torch.empty((num_tokens, d), dtype=FP8_DTYPE, device=x.device)
-    scales = torch.empty((num_tokens, num_groups), dtype=torch.float32, device=x.device)
+    # Column-major [num_tokens, num_groups] scales, as the CUTLASS block-FP8
+    # GEMM (the only consumer of this key) expects.
+    scales = torch.empty(
+        (num_groups, num_tokens), dtype=torch.float32, device=x.device
+    ).t()
 
     torch.ops._C.silu_and_mul_per_block_quant(
         out=result,
@@ -79,7 +83,7 @@ def _silu_and_mul_fp8_dynamic_block(
         scales=scales,
         group_size=group_size,
         scale_ub=None,
-        is_scale_transposed=False,
+        is_scale_transposed=True,
     )
 
     return QuantizedActivation(

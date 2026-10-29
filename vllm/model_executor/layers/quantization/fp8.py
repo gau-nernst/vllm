@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     resolve_fp8_moe_weight_block_shape,
     select_fp8_moe_backend,
 )
+from vllm.model_executor.layers.fusion.quant_activation import expose_input_quant_key
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -352,6 +353,8 @@ class Fp8LinearMethod(LinearMethodBase):
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
         )
+        if self.block_quant:
+            expose_input_quant_key(layer, self.fp8_linear)
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 

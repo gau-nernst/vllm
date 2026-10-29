@@ -12,6 +12,7 @@ from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
+    kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -299,6 +300,13 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 "quantization with group_shape=(1,128).",
             )
         return True, None
+
+    def input_quant_key(self) -> QuantKey | None:
+        # Producers must write fp32 scales column-major ([M, K / 128] with
+        # stride (1, M)), unpadded, matching self.quant_fp8.
+        if self.config.activation_quant_key == kFp8Dynamic128Sym:
+            return kFp8Dynamic128Sym
+        return None
 
     def apply_block_scaled_mm(
         self,
