@@ -41,7 +41,8 @@ namespace vllm {
 // grid-stride loop, so every launched thread has work for any shape (a rows x
 // column-blocks grid idles the threads of a partial last column block). The
 // host launches at most one full wave, so the initial index and the stride fit
-// in 32 bits; the running index is 64-bit.
+// in 32 bits; the running index is 64-bit. A second loop zeroes the scale
+// padding, as scaled_fp4_quant does.
 template <class Type, bool UE8M0_SF = false>
 __global__ void __launch_bounds__(256, VLLM_BLOCKS_PER_SM(256))
     silu_mul_cvt_fp16_to_fp4(int32_t numRows, int32_t numCols,
@@ -124,6 +125,44 @@ __global__ void __launch_bounds__(256, VLLM_BLOCKS_PER_SM(256))
       rowIdx++;
     }
   }
+
+  // Zero the scale padding (the swizzled scale tensor may come from
+  // torch.empty): scale columns numCols/16 .. 4 * numKTiles of the valid rows,
+  // and rows numRows .. round_up(numRows, 128). Padding items are numbered from
+  // the end of the grid, so at small M they go to threads without a data item.
+  int32_t const numSfCols = numCols / CVT_FP4_SF_VEC_SIZE;
+  int32_t const padCols = numKTiles * 4 - numSfCols;
+  int64_t const numPadColItems = int64_t(numRows) * padCols;
+  // One item per (k tile, row % 32) of the last, partial 128-row tile: 16
+  // contiguous scale bytes, rows r + 32 * i (i = 0..3) x 4 scale columns.
+  int32_t const firstPadRow = numRows % 128;  // within the last tile; 0: none
+  int32_t const numPadRowItems = firstPadRow ? 32 * numKTiles : 0;
+  uint8_t* const sf_bytes = reinterpret_cast<uint8_t*>(SFout);
+  for (int64_t p = stride - 1 - tid; p < numPadColItems + numPadRowItems;
+       p += stride) {
+    if (p < numPadColItems) {
+      int32_t const row = int32_t(p / padCols);
+      int32_t const col = numSfCols + int32_t(p % padCols);
+      *cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 1>(row, col, numKTiles,
+                                                       SFout) = 0;
+    } else {
+      int32_t const q = int32_t(p - numPadColItems);
+      int32_t const outer = q & 31;
+      uint8_t* const base =
+          sf_bytes + ((int64_t(numRows / 128) * numKTiles + (q >> 5)) << 9) +
+          outer * 16;
+      if (outer >= firstPadRow) {
+        *reinterpret_cast<uint4*>(base) = make_uint4(0, 0, 0, 0);
+      } else {
+#pragma unroll
+        for (int i = 1; i < 4; ++i) {
+          if (outer + 32 * i >= firstPadRow) {
+            reinterpret_cast<uint32_t*>(base)[i] = 0;
+          }
+        }
+      }
+    }
+  }
 }
 
 }  // namespace vllm
@@ -156,6 +195,12 @@ void silu_and_mul_nvfp4_quant_sm1xxa(
   int64_t const num_items = int64_t(m) * num_packed_cols;
   if (num_items == 0) return;
   constexpr int kBlockSize = 256;
+  // Scale-padding items (see the kernel): padded scale columns of the valid
+  // rows, and 16-byte groups of the padded rows.
+  int const num_k_tiles = vllm::div_round_up(n, 64);
+  int64_t const num_pad_items =
+      int64_t(m) * (num_k_tiles * 4 - n / CVT_FP4_SF_VEC_SIZE) +
+      (m % 128 ? 32 * num_k_tiles : 0);
 
   // PDL lets this grid launch while the producer GEMM is still running. That
   // pays for small inputs, but above ~4096 items per SM the early blocks slow
@@ -176,9 +221,9 @@ void silu_and_mul_nvfp4_quant_sm1xxa(
 
         // At most one full wave; larger inputs loop. (Splitting the items
         // evenly over fewer blocks was slower just above one wave.)
-        int64_t const num_blocks =
-            std::min(vllm::div_round_up<int64_t>(num_items, kBlockSize),
-                     int64_t(multiProcessorCount) * blocks_per_sm);
+        int64_t const num_blocks = std::min(
+            vllm::div_round_up<int64_t>(num_items + num_pad_items, kBlockSize),
+            int64_t(multiProcessorCount) * blocks_per_sm);
 
         cudaLaunchConfig_t config = {};
         config.gridDim = dim3(num_blocks);
