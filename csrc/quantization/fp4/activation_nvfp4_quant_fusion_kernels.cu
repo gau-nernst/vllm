@@ -34,6 +34,89 @@
 
 namespace vllm {
 
+#if CVT_FP4_PACK16
+// silu(gate) * up rounded to Type, then NVFP4 (UE4M3 scale) quantization of one
+// 16-element chunk: bit-identical to compute_silu_mul + cvt_warp_fp16_to_fp4,
+// in ~35 % fewer instructions (the kernel is issue-bound with those):
+// - __expf(-x) is ex2.approx(x * -log2(e)) plus a fixup for denormal
+//   results. With .ftz those results become 0, and 1 + e rounds to 1 either
+//   way. __fdividef(x, d) is x * rcp.approx(d).
+// - Element pairs use packed f32x2 mul/add (same rounding as the scalar ops).
+// - Elements stay in 32-bit words of two values, so bf16 unpacks with one
+//   shift or mask and the rounded silu * up words feed the abs-max directly.
+template <class Type>
+__device__ __forceinline__ u32x2 silu_mul_cvt_16_to_fp4(
+    PackedVec<Type, true> const& gate_vec, PackedVec<Type, true> const& up_vec,
+    float SFScaleVal, uint8_t* SFout) {
+  using packed_t = typename PackedTypeConverter<Type>::Type;
+  static_assert(sizeof(packed_t) == sizeof(uint32_t));
+  auto to_f2 = [](packed_t v) {
+    if constexpr (std::is_same_v<Type, __nv_bfloat16>) {
+      uint32_t const w = reinterpret_cast<uint32_t const&>(v);
+      return make_float2(__uint_as_float(w << 16),
+                         __uint_as_float(w & 0xffff0000u));
+    } else {
+      return cast_to_float2(v);
+    }
+  };
+  auto mul2 = [](float2 a, float2 b) {
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    return __fmul2_rn(a, b);
+  #else
+    return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+  #endif
+  };
+  auto ex2_ftz = [](float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+  };
+  auto rcp_ftz = [](float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+  };
+
+  float const neg_log2e = -1.4426950216293334961f;  // __expf's log2(e)
+  packed_t act[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float2 const x = to_f2(gate_vec.elts[i]);
+    float2 const t = mul2(x, make_float2(neg_log2e, neg_log2e));
+    float2 d = make_float2(ex2_ftz(t.x), ex2_ftz(t.y));
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    d = __fadd2_rn(d, make_float2(1.f, 1.f));
+  #else
+    d = make_float2(d.x + 1.f, d.y + 1.f);
+  #endif
+    float2 const silu = mul2(x, make_float2(rcp_ftz(d.x), rcp_ftz(d.y)));
+    act[i] = cast_to_packed<packed_t>(mul2(silu, to_f2(up_vec.elts[i])));
+  }
+
+  // Scale factor and quantization as in cvt_warp_fp16_to_fp4.
+  packed_t localMax = __habs2(act[0]);
+  #pragma unroll
+  for (int i = 1; i < 8; ++i) localMax = __hmax2(localMax, __habs2(act[i]));
+  float const vecMax = float(__hmax(localMax.x, localMax.y));
+  float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+  __nv_fp8_e4m3 const sf = __nv_fp8_e4m3(SFValue);
+  if (SFout) *SFout = reinterpret_cast<uint8_t const&>(sf);
+  SFValue = float(sf);
+  // reciprocal_approximate_ftz is asm volatile, so this stays after the input
+  // loads; hoisting it to kernel start stalls every thread on the SFScale load
+  // before it issues its first input load (+0.1-0.3 us at small M).
+  float const outputScale =
+      SFValue != 0.0f
+          ? rcp_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+          : 0.0f;
+  float2 scaled[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i)
+    scaled[i] = mul2(to_f2(act[i]), make_float2(outputScale, outputScale));
+  return fp32_vec16_to_e2m1(scaled);
+}
+#endif
+
 // Use UE4M3 by default.
 //
 // Work item i = row * num_packed_cols + col is one CVT_FP4_ELTS_PER_THREAD
@@ -98,17 +181,22 @@ __global__ void __launch_bounds__(256, VLLM_BLOCKS_PER_SM(256))
       ld128_cg_or_zero(reinterpret_cast<uint4&>(in_vec2), gate + numCols, true);
     }
 
-    // Compute silu and mul
-    PackedVec out_silu_mul = compute_silu_mul<Type>(in_vec, in_vec2);
-
     auto sf_out =
         cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
                                            CVT_FP4_NUM_THREADS_PER_SF>(
             rowIdx, colIdx, numKTiles, SFout);
 
-    auto out_val =
-        cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
-            out_silu_mul, SFScaleVal, sf_out);
+    auto const out_val = [&] {
+#if CVT_FP4_PACK16
+      if constexpr (!UE8M0_SF) {
+        return silu_mul_cvt_16_to_fp4<Type>(in_vec, in_vec2, SFScaleVal,
+                                            sf_out);
+      }
+#endif
+      PackedVec out_silu_mul = compute_silu_mul<Type>(in_vec, in_vec2);
+      return cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+          out_silu_mul, SFScaleVal, sf_out);
+    }();
 
     // The output is [numRows, num_packed_cols] chunks, row-major: item idx.
     if constexpr (CVT_FP4_PACK16) {
