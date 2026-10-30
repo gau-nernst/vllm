@@ -1,0 +1,105 @@
+# PP send buffer depth A/B for the upstream PR on Qwen3.5-397B-A17B-FP8 (dummy
+# weights), PP2 x TP1, CUDA graphs on, prefix caching on (mamba "align"),
+# prefill only (output len 1). Runs on upstream main + PR 1, no other patches.
+# All 60 layers are MoE with full attention every 4th layer, so the default
+# even split gives balanced stages (where the send stall can show).
+# Depth 0 = upstream wait before forward, 1 = PR 1, 2 = extra buffer.
+# Branch pp-send-buffer-eval. Benchmark: bench_pp_depth.sh (open-loop rates
+# relative to the depth-0 arm capacity; one nsys window at 0.85 x capacity).
+# Variants: vigil -c <this file> --list-variants
+base:
+  model: Qwen/Qwen3.5-397B-A17B-FP8
+  revision: ea5b4f81096f3901c91dea97f81324302495781d
+  mode: remote
+  precheck: true
+  collect_env: true
+
+  serving:
+    roles:
+      - role: worker
+        count: 1
+        nodes_per_instance: 1
+        gpus_per_node: 2
+        tp_size: 1
+        base_port: 8000
+        profiling:
+          mode: cuda
+          nsys_args: >-
+            -o {log_dir}/traces/qwen35_397b_pp2
+            --trace=cuda,nvtx
+            --backtrace=none
+            --cpuctxsw=none
+            --trace-fork-before-exec=true
+            --cuda-graph-trace=graph
+            --capture-range=cudaProfilerApi
+            --capture-range-end repeat:1:sync
+        vllm_engine:
+          repo_path: <WORKTREE of pp-send-buffer-eval>
+          cmd: >-
+            vllm serve {model}
+            --revision {revision}
+            --port {port}
+            -pp 2
+            --load-format dummy
+            --language-model-only
+            --max-model-len 131072
+            --max-num-batched-tokens 16384
+            --profiler-config '{"profiler": "cuda"}'
+          env:
+            HF_HUB_OFFLINE: "1"
+            HF_HUB_CACHE: <HF_HUB_CACHE>
+            TMPDIR: "/tmp/${USER}"
+            VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+            VLLM_SERVER_DEV_MODE: "1"
+            VLLM_USE_RUST_FRONTEND: "1"
+          health_check:
+            url: "http://localhost:{port}/health"
+            timeout_s: 3600
+            poll_interval_s: 10
+          stop_timeout_s: 15
+
+    remote:
+      launcher: slurm
+      slurm:
+        partition: <PARTITION>
+        nodelist: <NODE>  # pin one node for the A/B
+        time_limit: "1:00:00"
+        gpus_per_node: 4  # whole node: no neighbours on the other GPUs
+        grace_period_s: 300
+        node_cleanup: true
+
+  post_serve:
+    - cmd:
+        env:
+          HF_HUB_OFFLINE: "1"
+          HF_HUB_CACHE: <HF_HUB_CACHE>
+        cmd: >-
+          bash -c 'source <any vllm venv>/.venv/bin/activate &&
+          bash <path to>/pp_handoff/bench_pp_depth.sh
+          {remote_host} {log_dir} {model}'
+
+override_default_d0:
+  serving:
+    roles:
+      - role: worker
+        vllm_engine:
+          env:
+            VLLM_PP_SEND_BUFFER_DEPTH: "0"
+
+override_default_d1:
+  serving:
+    roles:
+      - role: worker
+        vllm_engine:
+          env:
+            VLLM_PP_SEND_BUFFER_DEPTH: "1"
+
+override_default_d2:
+  serving:
+    roles:
+      - role: worker
+        vllm_engine:
+          env:
+            VLLM_PP_SEND_BUFFER_DEPTH: "2"
+
