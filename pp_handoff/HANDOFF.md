@@ -6,7 +6,7 @@ Delete `pp_handoff/` before opening the upstream PR.
 
 | Branch | What |
 | --- | --- |
-| `pp-send-copy` | **PR 1.** Non-last PP ranks snapshot their outputs into one dedicated send buffer, so the next forward no longer waits for the previous send. Four commits (copy design, then the buffer); not squashed on purpose. This doc is the top commit. |
+| `pp-send-copy` | **PR 1.** Non-last PP ranks snapshot their outputs into one dedicated send buffer, so the next forward no longer waits for the previous send. Five commits (copy design, then the buffer, then a gate that limits the buffer to the V2 model runner — the V1 runner is untouched); not squashed on purpose. This doc is the top commit. |
 | `pp-send-buffer-eval` | PR 1 (without this doc) + eval-only `VLLM_PP_SEND_BUFFER_DEPTH` knob: 0 = upstream wait-before-forward, N = N buffers. One build serves every A/B arm. |
 | `pp-transport-copy-engine` | PR 2 prototype: one-sided send on CUDA copy engines (older preallocated-buffer commit underneath; rebase onto PR 1 when picked up). |
 | `pp-transport-rocm-sdma` | ROCm SDMA prototype on top of PR 2. |
@@ -39,13 +39,50 @@ Capacity probe at 64 in flight, then open-loop Poisson at 0.6/0.75/0.85/0.95/1.0
 - The freed time doesn't reach the critical path: stage 1 still starves for input
   (24.6% -> 23.1%). Unexplained: PP4 stage 1 starvation rose 8.8% -> 14.9%.
 
+## M3.1-Flash evidence (internal repro, Oct 2026)
+
+A colleague measured the same mechanism (buffered sends, then buffered sends +
+the copy-engine handoff prototype) on MiniMax-M3.1-Flash with real weights on
+B300, PP2 x TP1. Relative p50 TTFT vs the unchanged server, median over three
+rounds of within-round comparisons:
+
+- Buffered sends: -9% to -14% at 60-100% of saturation; saturated throughput
+  unchanged (+0.3-0.4%). Two independent node runs agree.
+- Buffered sends + copy-engine handoff: -8.5% to -18%, same load range.
+- Below ~half of saturation there is no gain (pipeline rarely full enough to
+  block); the changes remove waiting, not compute.
+- Single rounds are noisy: one round showed +13% at 0.96 x saturation while the
+  other two showed -14% and -18%. Repeat and compare within round.
+
+What has to match for a rerun:
+
+- Model: MiniMax-M3.1-Flash (HF `54e4e69d`), PP2 TP1,
+  `VLLM_PP_LAYER_PARTITION=30,30` (60 layers), `--moe-backend
+  flashinfer_cutedsl`, `--kv-cache-dtype nvfp4`, `--max-num-batched-tokens
+  32768`, `--long-prefill-token-threshold 8192`.
+- V2 model runner: the send ring only engages on non-last ranks of the V2
+  runner (PR 1 is now V2-only anyway).
+- Workload: prefill only; 100K shared prefix (~91% hit) + 7.5-12.5K new tokens
+  per request; Poisson open loop, 60-s windows; uneven step sizes are what make
+  the stages block each other (equal-length prompts hide most of the gain).
+- Protocol: run both arms at the same time on different GPU pairs of one node,
+  rotate the variants over the pairs for three rounds, compare within round,
+  take the median.
+
+The full repro doc and scripts live on internal shared storage (a colleague's
+`pp-bench/` handoff); ask for the path.
+
 ## Open questions / next steps
 
-1. **Measure on MiniMax-M3.1** (now runnable with PP: #61294 and M3.1 support merged).
-   Earlier M3.1 measurements suggested a TTFT gain where Qwen shows none; why is the open
-   question (stall on vs off the critical path, real vs random tokens, dummy weights, step
-   structure). Copy `qwen35_397b_pp2_send_depth.yaml`, swap model/serve flags (M3 used
-   `--trust-remote-code --block-size 128`), keep the bench.
+1. **Measure on MiniMax-M3.1** (now runnable with PP: #61294 and M3.1 support
+   merged). Decided run plan: `m31_flash_pp2_send_depth.yaml` (copy of the
+   Qwen config with the M3.1 flags above, real weights, V2 runner forced),
+   bench_pp_depth.sh unchanged (Qwen workload, 100K prefix + 2-8K new), arms
+   d0/d1, 3 interleaved rounds on one pinned node with FIXED_CAPACITY from
+   round 1's d0 arm, d2 only if d1 shows a gain. arm_check.py + analyze_depth.py
+   per run; GSM8K gate doubles as the real-weight correctness check (step 4).
+   Why M3.1 gains where Qwen does not is the open question (stall on vs off the
+   critical path, real vs random tokens, dummy weights, step structure).
 2. Decide PR 1 framing: stall-removal cleanup, TTFT win on M3.1, or fold into PR 2.
 3. Update the PR description: `pr_draft_old_copy_design.md` describes the earlier
    copy design and must be rewritten for the single buffer. No absolute TTFT numbers.
@@ -59,6 +96,8 @@ Capacity probe at 64 in flight, then open-loop Poisson at 0.6/0.75/0.85/0.95/1.0
   Depth 0 writes `capacity.txt` next to the arms; `FIXED_CAPACITY=<req/s>` pins it for reruns.
 - `qwen35_397b_pp2_send_depth.yaml`: vigil config (fill the `<...>` placeholders); PP4 is the
   same with `-pp 4`, `gpus_per_node: 4`.
+- `m31_flash_pp2_send_depth.yaml`: same for MiniMax-M3.1-Flash PP2 (real weights, V2 runner,
+  NVFP4 KV; see the M3.1 section above).
 - `arm_check.py <arm_dir>`: sanity flags per arm (errors, buffer depth vs arm, failures,
   a/b spread). `analyze_depth.py <run_dir>...`: relative TTFT table + nsys stall per stage.
 - `pp_sim.py`: event model above.

@@ -1,0 +1,106 @@
+# PP send buffer depth A/B on MiniMax-M3.1-Flash, PP2 x TP1, V2 model runner,
+# real weights, NVFP4 KV, prefill only (output len 1). Same benchmark as the
+# Qwen3.5-397B runs (bench_pp_depth.sh): 100K shared prefix + 2-8K new tokens,
+# capacity probe at 64 in flight, open-loop Poisson at 0.6-1.0 x the depth-0
+# arm's capacity, a/b passes keep b, one nsys window at 0.85 x capacity.
+# Depth 0 = upstream wait before forward, 1 = PR 1 (single send buffer).
+# Branch pp-send-buffer-eval. Variants: vigil -c <this file> --list-variants
+#
+# Serve flags come from the internal M3.1-Flash repro (see HANDOFF.md): the
+# send buffer engages only on the V2 model runner, and the PR is V2-only.
+# Repeats for the noise floor: 3 interleaved rounds (d0,d1),(d1,d0),(d0,d1) on
+# the same node, FIXED_CAPACITY from round 1's d0 arm for the reruns; compare
+# within round, take the median. Run d2 only if d1 shows a gain.
+base:
+  model: MiniMaxAI/MiniMax-M3.1-Flash
+  revision: 54e4e69d  # matches the internal repro; HF HEAD may be newer
+  mode: remote
+  precheck: true
+  collect_env: true
+
+  serving:
+    roles:
+      - role: worker
+        count: 1
+        nodes_per_instance: 1
+        gpus_per_node: 2
+        tp_size: 1
+        base_port: 8000
+        profiling:
+          mode: cuda
+          nsys_args: >-
+            -o {log_dir}/traces/m31_flash_pp2
+            --trace=cuda,nvtx
+            --backtrace=none
+            --cpuctxsw=none
+            --trace-fork-before-exec=true
+            --cuda-graph-trace=graph
+            --capture-range=cudaProfilerApi
+            --capture-range-end repeat:1:sync
+        vllm_engine:
+          repo_path: <WORKTREE of pp-send-buffer-eval>
+          cmd: >-
+            vllm serve {model}
+            --revision {revision}
+            --port {port}
+            -tp 1 -pp 2
+            --block-size 128
+            --kv-cache-dtype nvfp4
+            --moe-backend flashinfer_cutedsl
+            --language-model-only
+            --max-model-len 131072
+            --max-num-batched-tokens 32768
+            --long-prefill-token-threshold 8192
+            --profiler-config '{"profiler": "cuda"}'
+          env:
+            HF_HUB_OFFLINE: "1"
+            HF_HUB_CACHE: <HF_HUB_CACHE>
+            TMPDIR: "/tmp/${USER}"
+            VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+            VLLM_SERVER_DEV_MODE: "1"
+            VLLM_USE_RUST_FRONTEND: "1"
+            VLLM_USE_V2_MODEL_RUNNER: "1"
+            VLLM_PP_LAYER_PARTITION: "30,30"
+            VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: "{log_dir}/flashinfer_autotune"
+          health_check:
+            url: "http://localhost:{port}/health"
+            timeout_s: 3600
+            poll_interval_s: 10
+          stop_timeout_s: 15
+
+    remote:
+      launcher: slurm
+      slurm:
+        partition: <PARTITION>
+        nodelist: <NODE>  # pin one node for the A/B
+        time_limit: "2:00:00"
+        gpus_per_node: 2  # PP2; bump to the whole node if neighbours are a risk
+        grace_period_s: 300
+        node_cleanup: true
+
+  post_serve:
+    - cmd:
+        env:
+          HF_HUB_OFFLINE: "1"
+          HF_HUB_CACHE: <HF_HUB_CACHE>
+        cmd: >-
+          bash -c 'source <any vllm venv>/.venv/bin/activate &&
+          bash <path to>/pp_handoff/bench_pp_depth.sh
+          {remote_host} {log_dir} {model}'
+
+override_default_d0:
+  serving:
+    roles:
+      - role: worker
+        vllm_engine:
+          env:
+            VLLM_PP_SEND_BUFFER_DEPTH: "0"
+
+override_default_d1:
+  serving:
+    roles:
+      - role: worker
+        vllm_engine:
+          env:
+            VLLM_PP_SEND_BUFFER_DEPTH: "1"
