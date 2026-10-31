@@ -8,6 +8,7 @@ outputs are static; relayed aux states alias the receive buffer). Sending this
 snapshot moves the wait to the next copy into the buffer.
 """
 
+from math import prod
 from typing import Any
 
 import torch
@@ -32,9 +33,24 @@ def packed_nbytes(tensors: dict[str, Any]) -> int:
     return _layout(tensors)[1]
 
 
+def unpack_flat(tensors: dict[str, Any]) -> dict[str, Any]:
+    """Eval only: rebuild per-key tensor views from a flat send's payload."""
+    flat = tensors.pop("__flat__")
+    schema = tensors.pop("__schema__")
+    for key, offset, shape, dtype_str in schema:
+        dtype = getattr(torch, dtype_str.removeprefix("torch."))
+        nbytes = prod(shape) * dtype.itemsize
+        tensors[key] = flat[offset : offset + nbytes].view(dtype).view(shape)
+    return tensors
+
+
 class PPSendBuffer:
-    def __init__(self, nbytes: int, device: torch.device, depth: int = 1) -> None:
+    def __init__(
+        self, nbytes: int, device: torch.device, depth: int = 1, flat: bool = False
+    ) -> None:
         # Eval only: depth > 1 rotates through that many buffers.
+        # Eval only: flat sends the packed buffer as one tensor plus a schema.
+        self.flat = flat
         self.buffers = [
             torch.empty(nbytes, dtype=torch.uint8, device=device) for _ in range(depth)
         ]
@@ -67,15 +83,29 @@ class PPSendBuffer:
         buffer = self.buffers[i]
         for handle in self._works[i]:
             handle.wait()
-        staged: dict[str, Any] = {}
-        for key, value in tensors.items():
-            if key not in offsets:
-                staged[key] = value
-                continue
-            start = offsets[key]
-            view = buffer[start : start + value.nbytes]
-            staged[key] = view.view(value.dtype).view(value.shape)
-            staged[key].copy_(value)
+        if self.flat and offsets:
+            # Eval only: one send of the packed bytes; the schema rides the
+            # metadata channel so the receiver can rebuild views.
+            schema = []
+            for key in offsets:
+                value = tensors[key]
+                schema.append((key, offsets[key], tuple(value.shape), str(value.dtype)))
+                view = buffer[offsets[key] : offsets[key] + value.nbytes]
+                view.view(value.dtype).view(value.shape).copy_(value)
+            staged = {"__flat__": buffer[:nbytes], "__schema__": schema}
+            for key, value in tensors.items():
+                if key not in offsets:
+                    staged[key] = value
+        else:
+            staged = {}
+            for key, value in tensors.items():
+                if key not in offsets:
+                    staged[key] = value
+                    continue
+                start = offsets[key]
+                view = buffer[start : start + value.nbytes]
+                staged[key] = view.view(value.dtype).view(value.shape)
+                staged[key].copy_(value)
         handles = pp_group.isend_tensor_dict(staged, all_gather_group=all_gather_group)
         # The metadata handle is reaped by the group coordinator.
         self._works[i] = handles[1:]

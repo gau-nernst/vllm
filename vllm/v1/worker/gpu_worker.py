@@ -103,7 +103,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
-from vllm.v1.worker.pp_send_buffer import PPSendBuffer
+from vllm.v1.worker.pp_send_buffer import PPSendBuffer, unpack_flat
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -663,10 +663,17 @@ class Worker(WorkerBase):
         depth = int(os.environ.get("VLLM_PP_SEND_BUFFER_DEPTH", "1"))
         if nbytes == 0 or depth == 0:
             return 0
+        # Eval only: one send of the packed buffer instead of one per tensor.
+        flat = (
+            os.environ.get("VLLM_PP_SEND_FLAT", "0") == "1"
+            and get_tp_group().world_size == 1
+        )
         free_before, _ = torch.accelerator.get_memory_info(self.device)
         with self._maybe_get_memory_pool_context("workspace"):
-            self._pp_send_buffer = PPSendBuffer(nbytes, self.device, depth)
-        logger.info("PP send buffer: depth %d, %d bytes each", depth, nbytes)
+            self._pp_send_buffer = PPSendBuffer(nbytes, self.device, depth, flat=flat)
+        logger.info(
+            "PP send buffer: depth %d, %d bytes each, flat=%s", depth, nbytes, flat
+        )
         free_after, _ = torch.accelerator.get_memory_info(self.device)
         return free_before - free_after
 
@@ -1384,6 +1391,9 @@ class Worker(WorkerBase):
                 )
             )
             assert tensor_dict is not None
+            if "__flat__" in tensor_dict:
+                # Eval only: flat PP send prototype.
+                tensor_dict = unpack_flat(tensor_dict)
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,

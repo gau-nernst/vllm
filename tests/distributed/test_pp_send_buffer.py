@@ -10,7 +10,7 @@ import ray
 import torch
 
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
-from vllm.v1.worker.pp_send_buffer import PPSendBuffer, packed_nbytes
+from vllm.v1.worker.pp_send_buffer import PPSendBuffer, packed_nbytes, unpack_flat
 
 from ..utils import (
     init_test_distributed_environment,
@@ -29,6 +29,17 @@ def _fill(step: int, rank: int, key: int) -> int:
 def send_buffer_chain_worker(
     monkeypatch, tp_size, pp_size, rank, distributed_init_port
 ):
+    _run_chain(False, tp_size, pp_size, rank, distributed_init_port)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def send_buffer_chain_flat_worker(
+    monkeypatch, tp_size, pp_size, rank, distributed_init_port
+):
+    _run_chain(True, tp_size, pp_size, rank, distributed_init_port)
+
+
+def _run_chain(flat, tp_size, pp_size, rank, distributed_init_port):
     torch.accelerator.set_device_index(rank)
     init_test_distributed_environment(1, pp_size, rank, distributed_init_port)
     pp_group = get_pp_group()
@@ -42,13 +53,17 @@ def send_buffer_chain_worker(
     # Persistent receive buffer, relayed onward as views.
     relayed = zeros()
     payload = dict(outputs) if first else dict(outputs, relay=relayed)
-    send_buffer = None if last else PPSendBuffer(packed_nbytes(payload), "cuda")
+    send_buffer = (
+        None if last else PPSendBuffer(packed_nbytes(payload), "cuda", flat=flat)
+    )
 
     lag = torch.randn(4096, 4096, device="cuda")
     for step in range(STEPS):
         n = (MAX_ROWS, 1, 1337, 512)[step % 4]
         if not first:
             received = pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
+            if "__flat__" in received:
+                received = unpack_flat(received)
             expected = {"hidden_states": 0, "residual": 1}
             for key, offset in expected.items():
                 want = _fill(step, rank - 1, offset)
@@ -81,11 +96,16 @@ def send_buffer_chain_worker(
     torch.distributed.barrier(group=pp_group.cpu_group)
 
 
+WORKERS = {"dict": send_buffer_chain_worker, "flat": send_buffer_chain_flat_worker}
+
+
 @multi_gpu_test(num_gpus=2)
-def test_pp_send_buffer_pp2(monkeypatch: pytest.MonkeyPatch):
-    multi_process_parallel(monkeypatch, 1, 2, send_buffer_chain_worker)
+@pytest.mark.parametrize("worker", WORKERS.values(), ids=WORKERS.keys())
+def test_pp_send_buffer_pp2(monkeypatch: pytest.MonkeyPatch, worker):
+    multi_process_parallel(monkeypatch, 1, 2, worker)
 
 
 @multi_gpu_test(num_gpus=4)
-def test_pp_send_buffer_pp4(monkeypatch: pytest.MonkeyPatch):
-    multi_process_parallel(monkeypatch, 1, 4, send_buffer_chain_worker)
+@pytest.mark.parametrize("worker", WORKERS.values(), ids=WORKERS.keys())
+def test_pp_send_buffer_pp4(monkeypatch: pytest.MonkeyPatch, worker):
+    multi_process_parallel(monkeypatch, 1, 4, worker)
