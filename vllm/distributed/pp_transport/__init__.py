@@ -74,4 +74,8 @@ def create_pp_transport(
                 f"VLLM_PP_TRANSPORT=copy_engine is not usable here: {reason}"
             )
         logger.info_once("PP transport: NCCL (copy engines unavailable: %s)", reason)
-    return NcclTransport(get_tp_group(), profile_send)
+    nccl = NcclTransport(get_tp_group(), profile_send)
+    logger.info_once(
+        "PP transport: NCCL%s", "" if profile_send is None else " with send buffers"
+    )
+    return nccl
