@@ -82,6 +82,10 @@ def make_mxfp8_idesc(MMA_M: int, MMA_N: int):
     return Uint32((MMA_N >> 3 << 17) | (1 << 23) | (MMA_M >> 7 << 27))
 
 
+def make_nvfp4_idesc(MMA_M: int, MMA_N: int):
+    return Uint32((1 << 7) | (1 << 10) | (MMA_N >> 3 << 17) | (MMA_M >> 7 << 27))
+
+
 @dsl_user_op
 def mma_f16(
     d_tmem,
@@ -156,6 +160,42 @@ def mma_mxfp8(
     with cute.arch.elect_one():
         nvvm.tcgen05_mma_block_scale(
             nvvm.Tcgen05MMAKind.MXF8F6F4,
+            NVVM_CTA_GROUP_MAP[cta_group],
+            _make_tmem_llvm_ptr(d_tmem, loc=loc, ip=ip),
+            Uint64(a_desc).ir_value(loc=loc, ip=ip),
+            Uint64(b_desc).ir_value(loc=loc, ip=ip),
+            Int32(idesc).ir_value(loc=loc, ip=ip),
+            Boolean(enable_input_d).ir_value(loc=loc, ip=ip),
+            _make_tmem_llvm_ptr(sfa_tmem, loc=loc, ip=ip),
+            _make_tmem_llvm_ptr(sfb_tmem, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+            **scale_kwargs,
+        )
+
+
+@dsl_user_op
+def mma_nvfp4(
+    d_tmem,
+    a_desc,
+    b_desc,
+    idesc,
+    sfa_tmem,
+    sfb_tmem,
+    enable_input_d,
+    cta_group: int = 1,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    # CuTe DSL 4.8 renamed the block-scale enum and keyword.
+    if hasattr(nvvm, "Tcgen05MMABlockScale"):
+        scale_kwargs = {"block_scale": nvvm.Tcgen05MMABlockScale.BLOCK16}
+    else:
+        scale_kwargs = {"scale_vec_size": nvvm.Tcgen05MMAScaleVecSize.X4}
+    with cute.arch.elect_one():
+        nvvm.tcgen05_mma_block_scale(
+            nvvm.Tcgen05MMAKind.MXF4NVF4,
             NVVM_CTA_GROUP_MAP[cta_group],
             _make_tmem_llvm_ptr(d_tmem, loc=loc, ip=ip),
             Uint64(a_desc).ir_value(loc=loc, ip=ip),

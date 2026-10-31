@@ -10,6 +10,22 @@ from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
 
+def interleave_gate_up_rows(t: torch.Tensor) -> torch.Tensor:
+    """Permute a [2*I, ...] gate_up tensor's rows into 64-row [gate, up]
+    blocks: [g64_0, u64_0, g64_1, u64_1, ...].
+
+    One 128-row blockscale swizzle atom then holds the gate and up rows of
+    one 64-column output block, so the fused gemm1_swiglu_nvfp4 kernel reads
+    a matching pair per 128-row tile. Must be applied before
+    swizzle_blockscale.
+    """
+    i = t.shape[0] // 2
+    assert t.shape[0] % 128 == 0
+    gate = t[:i].view(i // 64, 64, *t.shape[1:])
+    up = t[i:].view(i // 64, 64, *t.shape[1:])
+    return torch.stack((gate, up), dim=1).reshape(t.shape)
+
+
 def swizzle_blockscale(scale: torch.Tensor) -> torch.Tensor:
     """Pad and block-interleave the FP4 block-scales so that they match the data
     layout expected by the CUTLASS / FlashInfer kernels.

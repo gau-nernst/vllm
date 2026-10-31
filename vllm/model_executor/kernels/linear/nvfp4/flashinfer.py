@@ -9,6 +9,7 @@ from vllm.model_executor.layers.fusion.quant_activation import (
     as_quantized_activation,
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    interleave_gate_up_rows,
     nvfp4_weight_padding_bytes,
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight_for_cutlass,
@@ -129,13 +130,18 @@ class FlashInferCuteDslNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # The fused gemm1_swiglu_nvfp4 path of Qwen3_5DenseMLP sets this flag:
+        # permute rows into 64-row [gate, up] blocks before swizzling, so one
+        # 512B scale atom holds a matching gate/up pair per 128-row tile.
+        interleave = getattr(layer, "_gemm1_swiglu_nvfp4_interleave", False)
+        scale = layer.weight_scale.data
+        weight = layer.weight.data
+        if interleave:
+            scale = interleave_gate_up_rows(scale)
+            weight = interleave_gate_up_rows(weight)
         # cutedsl uses the same swizzled + padded layout as cutlass.
-        replace_parameter(
-            layer,
-            "weight_scale",
-            swizzle_blockscale(layer.weight_scale.data),
-        )
-        padded_weight, _ = pad_nvfp4_weight_for_cutlass(layer.weight.data)
+        replace_parameter(layer, "weight_scale", swizzle_blockscale(scale))
+        padded_weight, _ = pad_nvfp4_weight_for_cutlass(weight)
         replace_parameter(layer, "weight", padded_weight)
 
     def apply_weights(

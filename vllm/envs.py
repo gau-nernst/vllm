@@ -2364,6 +2364,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    # Disable the fused NVFP4 gate_up+SwiGLU+quant GEMM in Qwen3_5DenseMLP
+    # (falls back to the unfused GEMM + act+quant chain).
+    "VLLM_QWEN3_5_DISABLE_FUSED_GEMM1": lambda: bool(
+        int(os.getenv("VLLM_QWEN3_5_DISABLE_FUSED_GEMM1", "0"))
+    ),
     # Whether to skip version suffix when building package
     "VLLM_SKIP_VERSION_SUFFIX": lambda: bool(
         int(os.getenv("VLLM_SKIP_VERSION_SUFFIX", "0"))

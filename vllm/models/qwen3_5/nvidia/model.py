@@ -125,6 +125,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 
+from .mlp import Qwen3_5DenseMLP
 from .ops.fused_gdn_gated_norm import fused_gdn_gated_rms_norm
 from .ops.fused_norm_quant import FP8_DTYPE, gemma_add_rms_norm_quant
 
@@ -320,13 +321,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     moe_config.skip_final_all_reduce = False
                 self.mlp_output_is_partial = moe_partial_ok
         elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3NextMLP(
+            self.mlp = Qwen3_5DenseMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
                 reduce_results=not self.use_fused_allreduce_norm,
+                enable_lora=vllm_config.lora_config is not None,
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
