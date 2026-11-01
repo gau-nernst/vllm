@@ -73,6 +73,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.platforms import current_platform
 
@@ -249,7 +250,7 @@ class QuarkConfig(QuantizationConfig):
             if issubclass(layer_type, LinearBase):
                 return None, None, UnquantizedLinearMethod
             return None, None, None
-        if issubclass(layer_type, LinearBase):
+        if issubclass(layer_type, (LinearBase, ParallelLMHead)):
             weight_quant_key, activation_key, _ = self.get_scheme_cls(
                 layer_type, prefix
             )
