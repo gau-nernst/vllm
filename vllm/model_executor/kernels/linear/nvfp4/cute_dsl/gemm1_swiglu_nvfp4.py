@@ -760,13 +760,13 @@ class Gemm1SwigluNvfp4Kernel(VllmCuTeDSLJitKernel["Gemm1SwigluNvfp4Kernel.Compil
         self, n2: int, k2: int, max_m: int
     ) -> list["Gemm1SwigluNvfp4Kernel.CompileKey"]:
         num_sms = num_compute_units()
-        # m=1 and m=128 reach the 1-CTA configs (narrow and full A box),
-        # max_m the 2-CTA one.
+        # m=1 and m=128 reach the 1-CTA configs (narrow and full A box). The
+        # cg2 choice is nonmonotonic in m (it depends on ceil(m/256) vs the
+        # wave count, which steps at 256-row boundaries), so probe every
+        # 256-row band up to max_m to catch any cg2 band.
+        ms = {1, 128, max_m} | set(range(256, max_m + 1, 256))
         return list(
-            dict.fromkeys(
-                self.dispatch(m=m, n2=n2, k2=k2, num_sms=num_sms)
-                for m in (1, 128, max_m)
-            )
+            dict.fromkeys(self.dispatch(m=m, n2=n2, k2=k2, num_sms=num_sms) for m in ms)
         )
 
 
