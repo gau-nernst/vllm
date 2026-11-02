@@ -29,7 +29,15 @@ cta_rank, multicast to both CTAs (2-CTA config; plain copy for 1-CTA);
 CTA0's MMA warp tcgen05.cp's both slots to tmem (4 cols per 128-row block
 per k-block) and advances SF tmem pointers per k-block (no idesc SF-id
 fields). Multicast credits the mapped barrier per destination CTA, so
-stage tx counts SFB twice (see stage_size).
+stage tx counts SFB twice (see b_stage_size).
+
+Warps: 0-3 epilogue, 4 MMA, 5 B/SFB TMA, 6 A/SFA TMA. The two TMA warps
+have separate stage barriers: weights don't depend on the producer kernel,
+so the B/SFB warp starts streaming before gdc_wait (overlapping the
+producer via its early PDL trigger) while the A/SFA warp gdc-waits first.
+launch_dependents: immediate for 1-CTA (the persistent grid already holds
+all SMs, so a prelaunched dependent is free); after all TMA issues for
+2-CTA.
 
 Epilogue math is packed f32x2 (TensorSSA vector arith on 32-wide halves);
 MUFU exp2/rcp stay scalar. Output stores use L1::no_allocate (Q is consumed
@@ -124,10 +132,13 @@ class _Gemm1SwigluNvfp4:
         # 2-CTA: SFB is multicast and credits the mapped barrier per
         # destination CTA (2x the box). 1-CTA: single plain copy.
         sfb_blocks = 2 if cta_group == 2 else 1
-        # per-stage mbarrier tx bytes: A + this rank's B/SFB copy + SFA
-        self.stage_size = (A_BOX_HEIGHT + BN // cta_group) * (BK // 2) + (
-            BM // 128 + sfb_blocks
-        ) * (BK // 64) * 512
+        # per-stage mbarrier tx bytes, split per operand group: the B/SFB
+        # (weights) warp never gdc-waits; the A/SFA warp waits for the
+        # producer kernel (its data depends on it).
+        self.b_stage_size = (BN // cta_group) * (BK // 2) + sfb_blocks * (
+            BK // 64
+        ) * 512
+        self.a_stage_size = A_BOX_HEIGHT * (BK // 2) + (BM // 128) * (BK // 64) * 512
         # per-stage smem: SFB reserves all cta_group slots
         smem_stage = (A_BOX_HEIGHT + BN // cta_group) * (BK // 2) + (
             BM // 128 + BN // 128
@@ -215,7 +226,7 @@ class _Gemm1SwigluNvfp4:
 
         self.kernel(A_tma, B_tma, SFA_tma, SFB_tma, Q, SFQ, alpha, gsf_inv).launch(
             grid=(grid_size, 1, 1),
-            block=(6 * 32, 1, 1),
+            block=(7 * 32, 1, 1),
             cluster=(self.cta_group, 1, 1),
             stream=stream,
             use_pdl=True,
@@ -270,8 +281,10 @@ class _Gemm1SwigluNvfp4:
             byte_alignment=128,
         )
 
-        tma_full_mbar = smem.allocate_array(Int64, num_stages)
-        tma_empty_mbar = smem.allocate_array(Int64, num_stages)
+        b_full_mbar = smem.allocate_array(Int64, num_stages)
+        b_empty_mbar = smem.allocate_array(Int64, num_stages)
+        a_full_mbar = smem.allocate_array(Int64, num_stages)
+        a_empty_mbar = smem.allocate_array(Int64, num_stages)
         tmem_full_mbar = smem.allocate_array(Int64, 2)
         tmem_empty_mbar = smem.allocate_array(Int64, 2)
         if cutlass.const_expr(BN == 256):
@@ -309,8 +322,10 @@ class _Gemm1SwigluNvfp4:
         if warp_id == 0:
             with cute.arch.elect_one():
                 for i in cutlass.range_constexpr(num_stages):
-                    cute.arch.mbarrier_init(tma_full_mbar + i, cta_group)
-                    cute.arch.mbarrier_init(tma_empty_mbar + i, 1)
+                    cute.arch.mbarrier_init(b_full_mbar + i, cta_group)
+                    cute.arch.mbarrier_init(b_empty_mbar + i, 1)
+                    cute.arch.mbarrier_init(a_full_mbar + i, cta_group)
+                    cute.arch.mbarrier_init(a_empty_mbar + i, 1)
                 for i in cutlass.range_constexpr(2):
                     cute.arch.mbarrier_init(tmem_full_mbar + i, 1)
                     cute.arch.mbarrier_init(tmem_empty_mbar + i, 128 * cta_group)
@@ -326,34 +341,35 @@ class _Gemm1SwigluNvfp4:
         cute.arch.cluster_arrive_relaxed()
         cute.arch.cluster_wait()
 
-        cute.arch.griddepcontrol_wait()
-
         #
-        # TMA load warp
+        # B/SFB TMA warp: weights don't depend on the producer kernel, so
+        # stream them without gdc_wait (the producer's early PDL trigger lets
+        # this overlap the producer). cg1: hand off to the dependent kernel
+        # (down_proj) immediately — the persistent grid already occupies all
+        # SMs, so a prelaunched dependent costs nothing. cg2 keeps the late
+        # signal (after all issues), as before.
         #
         if warp_id == 5:
             tma_stage = 0
             parity = 1
-            tma_full_mbar_ = to_cta0_smem(tma_full_mbar)
+            b_full_mbar_ = to_cta0_smem(b_full_mbar)
 
-            gA_tiles = cute.zipped_divide(A_tma.tma_tensor, (self.a_box_height, BK))
             gB_tiles = cute.zipped_divide(B_tma.tma_tensor, (BN // cta_group, BK))
-            gSFA_tiles = cute.zipped_divide(
-                SFA_tma.tma_tensor, (128 * BKsf // 8, BM // 128)
-            )
             gSFB_tiles = cute.zipped_divide(SFB_tma.tma_tensor, (128 * BKsf // 8, 1))
 
+            if cutlass.const_expr(cta_group == 1):
+                cute.arch.griddepcontrol_launch_dependents()
             for work_id in range(raw_bid, total_tiles, num_bids):
                 bid_m, bid_n = compute_bid(work_id, GROUP_M, grid_m, grid_n)
                 bid_n_ = bid_n * cta_group + cta_rank
 
                 for iter_k in cutlass.range(K // BK, unroll=1):
-                    mbar = tma_full_mbar_ + tma_stage
-                    cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, parity)
+                    mbar = b_full_mbar_ + tma_stage
+                    cute.arch.mbarrier_wait(b_empty_mbar + tma_stage, parity)
                     with cute.arch.elect_one():
-                        mbarrier.arrive_expect_tx(mbar, self.stage_size, "cluster")
+                        mbarrier.arrive_expect_tx(mbar, self.b_stage_size, "cluster")
                     # SFB first: for 2-CTA the 2-hop multicast delivery gates
-                    # the stage barrier, so it must land under A/B.
+                    # the stage barrier, so it must land under B.
                     if cutlass.const_expr(cta_group == 2):
                         simple_tma_copy(
                             SFB_tma.atom,
@@ -372,17 +388,46 @@ class _Gemm1SwigluNvfp4:
                             cache_policy=EVICT_FIRST,
                         )
                     simple_tma_copy(
-                        A_tma.atom,
-                        gA_tiles[None, (bid_m, iter_k, 0)],
-                        sA[None, None, tma_stage],
-                        mbar,
-                    )
-                    simple_tma_copy(
                         B_tma.atom,
                         gB_tiles[None, (bid_n_, iter_k, 0)],
                         sB[None, None, tma_stage],
                         mbar,
                         cache_policy=EVICT_FIRST,
+                    )
+                    tma_stage = (tma_stage + 1) % num_stages
+                    if tma_stage == 0:
+                        parity ^= 1
+
+            if cutlass.const_expr(cta_group == 2):
+                cute.arch.griddepcontrol_launch_dependents()
+
+        #
+        # A/SFA TMA warp: the activation depends on the producer kernel.
+        #
+        if warp_id == 6:
+            cute.arch.griddepcontrol_wait()
+            tma_stage = 0
+            parity = 1
+            a_full_mbar_ = to_cta0_smem(a_full_mbar)
+
+            gA_tiles = cute.zipped_divide(A_tma.tma_tensor, (self.a_box_height, BK))
+            gSFA_tiles = cute.zipped_divide(
+                SFA_tma.tma_tensor, (128 * BKsf // 8, BM // 128)
+            )
+
+            for work_id in range(raw_bid, total_tiles, num_bids):
+                bid_m, bid_n = compute_bid(work_id, GROUP_M, grid_m, grid_n)
+
+                for iter_k in cutlass.range(K // BK, unroll=1):
+                    mbar = a_full_mbar_ + tma_stage
+                    cute.arch.mbarrier_wait(a_empty_mbar + tma_stage, parity)
+                    with cute.arch.elect_one():
+                        mbarrier.arrive_expect_tx(mbar, self.a_stage_size, "cluster")
+                    simple_tma_copy(
+                        A_tma.atom,
+                        gA_tiles[None, (bid_m, iter_k, 0)],
+                        sA[None, None, tma_stage],
+                        mbar,
                     )
                     simple_tma_copy(
                         SFA_tma.atom,
@@ -393,8 +438,6 @@ class _Gemm1SwigluNvfp4:
                     tma_stage = (tma_stage + 1) % num_stages
                     if tma_stage == 0:
                         parity ^= 1
-
-            cute.arch.griddepcontrol_launch_dependents()
 
         #
         # MMA warp (2-CTA collective; only cta_rank 0 issues)
@@ -449,7 +492,10 @@ class _Gemm1SwigluNvfp4:
                         )
 
                         cute.arch.mbarrier_wait(
-                            tma_full_mbar + tma_stage, tma_full_parity
+                            b_full_mbar + tma_stage, tma_full_parity
+                        )
+                        cute.arch.mbarrier_wait(
+                            a_full_mbar + tma_stage, tma_full_parity
                         )
                         _tcgen05.fence_after_thread_sync()
 
@@ -489,9 +535,8 @@ class _Gemm1SwigluNvfp4:
                                 enable_input_d,
                                 cta_group,
                             )
-                        _tcgen05.commit(
-                            tma_empty_mbar + tma_stage, mcast_mask, cta_group
-                        )
+                        _tcgen05.commit(b_empty_mbar + tma_stage, mcast_mask, cta_group)
+                        _tcgen05.commit(a_empty_mbar + tma_stage, mcast_mask, cta_group)
 
                         tma_stage = (tma_stage + 1) % num_stages
                         if tma_stage == 0:
