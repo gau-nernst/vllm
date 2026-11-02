@@ -138,8 +138,8 @@ class Qwen3_5DenseMLP(Qwen2MoeMLP):
         alpha = self._alpha
         down_gsf_inv = self._down_gsf_inv
         assert alpha is not None and down_gsf_inv is not None
-        # A pre-quantized input (from a fused norm) may carry padding rows
-        # past orig_shape, which avoids the TMA out-of-bounds cost.
+        # A pre-quantized input (from a fused norm) is exact-row; the
+        # kernel's narrow A box keeps TMA out-of-bounds fill cheap at small M.
         qa = (
             self._quantize_padded(x)
             if isinstance(x, torch.Tensor)
