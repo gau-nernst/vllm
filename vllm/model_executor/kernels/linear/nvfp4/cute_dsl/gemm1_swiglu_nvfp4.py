@@ -3,8 +3,8 @@
 """NVFP4 gate_up GEMM + SwiGLU + NVFP4-quant epilogue (SM100/SM103).
 
 Low-level CuTe-DSL kernel (hand-built TMA atoms and smem/instruction
-descriptors, raw _tcgen05 ops, stage count from smem capacity) on an
-INTERLEAVED gate_up weight: rows are permute-interleaved in 64-row blocks
+descriptors, raw _tcgen05 ops, stage count from smem capacity capped at 6)
+on an INTERLEAVED gate_up weight: rows are permute-interleaved in 64-row blocks
 [g64_0, u64_0, g64_1, u64_1, ...] (see interleave_gate_up_rows, applied at
 weight-load time) and the 128x4-swizzled SFB covers those rows, so one 512B
 swizzle atom holds the gate and up rows of one 64-column output block.
@@ -143,7 +143,10 @@ class _Gemm1SwigluNvfp4:
         smem_stage = (A_BOX_HEIGHT + BN // cta_group) * (BK // 2) + (
             BM // 128 + BN // 128
         ) * (BK // 64) * 512
-        self.num_stages = _SMEM_CAPACITY // smem_stage
+        # Cap at 6: only the A_BOX_HEIGHT=32 config would get more (9), and
+        # 148 CTAs each queueing 9 stages of TMA prefetch measurably thrashes
+        # DRAM row locality (~2us at tp1 m<=32; neutral everywhere else).
+        self.num_stages = min(_SMEM_CAPACITY // smem_stage, 6)
 
     @cute.jit
     def prepare_AB(self, A: cute.Tensor, BR: int, BK: int) -> cpasync.TmaInfo:
