@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dense Qwen3.5 MLP with the fused NVFP4 gate_up + SwiGLU + quant GEMM.
 
-Only the dense MLP uses this class. ``Qwen2MoeMLP`` stays the shared expert of
-the MoE variants, where it runs on an aux stream beside the routed experts and
-a persistent all-SM grid would contend with them.
+Only the dense MLP uses this class; no Qwen3.5 NVFP4 checkpoint has a
+shared expert, and the MoE variants' optional shared expert (Qwen2MoeMLP)
+keeps the unfused path.
 """
 
 import torch
