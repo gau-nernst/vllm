@@ -505,7 +505,6 @@ class _Gemm1SwigluNvfp4:
         if warp_id < 4:
             if warp_id == 0:
                 _tcgen05.alloc(taddr, cta_group)
-                _tcgen05.relinquish_alloc_permit(cta_group)
                 cute.arch.barrier(barrier_id=BAR_TMEM_ALLOC, number_of_threads=2 * 32)
 
             rcp6 = Float32(1.0 / 6.0)
