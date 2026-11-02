@@ -179,8 +179,8 @@ def test_gemm1_swiglu_nvfp4_vs_chain(default_vllm_config, m: int, i: int):
         x_sf,
         interleave_gate_up_rows(w_fp4),
         swizzle_blockscale(interleave_gate_up_rows(w_sf)),
-        float(alpha),
-        float(down_gsf_inv),
+        alpha,
+        down_gsf_inv,
     )
     _check_vs_chain(q, sf, q_ref, sf_ref, m, f"m={m},i={i}")
 
@@ -205,8 +205,8 @@ def test_gemm1_swiglu_nvfp4_padding(default_vllm_config, m: int, i: int, pad_m: 
         x_sf,
         interleave_gate_up_rows(w_fp4),
         swizzle_blockscale(interleave_gate_up_rows(w_sf)),
-        float(alpha),
-        float(down_gsf_inv),
+        alpha,
+        down_gsf_inv,
         m=m,
     )
     _check_vs_chain(q, sf, q_ref, sf_ref, m, f"m={m},pad={pad_m}")
@@ -245,8 +245,8 @@ def test_gemm1_swiglu_nvfp4_through_down_proj(default_vllm_config, m: int, i: in
         x_sf,
         interleave_gate_up_rows(w_fp4),
         swizzle_blockscale(interleave_gate_up_rows(w_sf)),
-        float(alpha),
-        float(down_gsf_inv),
+        alpha,
+        down_gsf_inv,
     )
 
     y_ref = _down_proj(q_ref, sf_ref, down_gsf_inv, m, i, seed=99)
@@ -379,3 +379,15 @@ def test_qwen3_5_dense_mlp_fused(default_vllm_config, dist_init):
     finalize_layerwise_reload(mlp, None)
     assert mlp.gate_up_proj.weight.data_ptr() == weight_ptr
     torch.testing.assert_close(mlp(x), y, rtol=0, atol=0)
+
+    # A reload with different scales must take effect (alpha/gsf_inv are
+    # read from the layers' device buffers at every launch).
+    ckpt2 = _nvfp4_checkpoint(hidden, i, seed=23)
+    ref2 = _nvfp4_mlp(Qwen2MoeMLP, hidden, i)
+    _load(ref2, ckpt2)
+    _process(ref2)
+    initialize_layerwise_reload(mlp)
+    _load(mlp, ckpt2)
+    finalize_layerwise_reload(mlp, None)
+    err = (mlp(x).float() - ref2(x).float()).norm(dim=1)
+    assert (err / ref2(x).float().norm(dim=1)).max().item() < 0.10

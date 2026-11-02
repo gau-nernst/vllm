@@ -48,8 +48,6 @@ class Qwen3_5DenseMLP(Qwen2MoeMLP):
             and not envs.VLLM_QWEN3_5_DISABLE_FUSED_GEMM1
             and self._can_fuse_gemm1()
         )
-        self._alpha: float | None = None
-        self._down_gsf_inv: float | None = None
         if self.fused_gemm1:
             from vllm.model_executor.kernels.linear.nvfp4.cute_dsl.gemm1_swiglu_nvfp4 import (  # noqa: E501
                 warmup_gemm1_swiglu_nvfp4,
@@ -130,14 +128,6 @@ class Qwen3_5DenseMLP(Qwen2MoeMLP):
         )
 
         gate_up = self.gate_up_proj
-        # Static per-layer scales; hoist the device->host read out of the
-        # per-call path (and out of CUDA graph capture).
-        if self._alpha is None:
-            self._alpha = float(gate_up.alpha)
-            self._down_gsf_inv = float(self.down_proj.input_global_scale_inv)
-        alpha = self._alpha
-        down_gsf_inv = self._down_gsf_inv
-        assert alpha is not None and down_gsf_inv is not None
         # A pre-quantized input (from a fused norm) is exact-row; the
         # kernel's narrow A box keeps TMA out-of-bounds fill cheap at small M.
         qa = (
@@ -152,8 +142,8 @@ class Qwen3_5DenseMLP(Qwen2MoeMLP):
             qa.scale,
             gate_up.weight,
             gate_up.weight_scale,
-            alpha,
-            down_gsf_inv,
+            gate_up.alpha,
+            self.down_proj.input_global_scale_inv,
             m=m,
         )
         out, _ = self.down_proj(

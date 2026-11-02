@@ -41,9 +41,9 @@ all SMs, so a prelaunched dependent is free); after all TMA issues for
 
 Epilogue math is packed f32x2 (TensorSSA vector arith on 32-wide halves);
 MUFU exp2/rcp stay scalar. Output stores use L1::no_allocate (Q is consumed
-by the next kernel, not reused on-chip). alpha/gsf_inv are scalar kernel
-arguments: both are static per-layer constants (checkpoint scales fused at
-weight load), so there is no per-call device-side scale computation.
+by the next kernel, not reused on-chip). alpha/gsf_inv are read from the
+layer's own 1-element buffers per launch, so in-place checkpoint reloads
+(RL refit) stay correct without recapturing CUDA graphs.
 """
 
 from dataclasses import dataclass
@@ -196,8 +196,8 @@ class _Gemm1SwigluNvfp4:
         SFB: cute.Tensor,  # flat uint8, swizzled 128x4 over interleaved rows
         Q: cute.Tensor,  # (M, I//2) uint8 output
         SFQ: cute.Tensor,  # flat int32, swizzled output scales
-        alpha: Float32,
-        gsf_inv: Float32,
+        mAlpha: cute.Tensor,  # (1,) fp32 gate_up alpha
+        mGsfInv: cute.Tensor,  # (1,) fp32 down_proj input_global_scale_inv
         grid_size: Int32,
         stream: CUstream,
     ) -> None:
@@ -227,7 +227,7 @@ class _Gemm1SwigluNvfp4:
             SFB, n2, k // 16, BN // self.cta_group, BK // 16, self.cta_group == 2
         )
 
-        self.kernel(A_tma, B_tma, SFA_tma, SFB_tma, Q, SFQ, alpha, gsf_inv).launch(
+        self.kernel(A_tma, B_tma, SFA_tma, SFB_tma, Q, SFQ, mAlpha, mGsfInv).launch(
             grid=(grid_size, 1, 1),
             block=(7 * 32, 1, 1),
             cluster=(self.cta_group, 1, 1),
@@ -244,8 +244,8 @@ class _Gemm1SwigluNvfp4:
         SFB_tma: cpasync.TmaInfo,
         Q_tensor: cute.Tensor,
         SFQ_tensor: cute.Tensor,
-        alpha: Float32,
-        gsf_inv: Float32,
+        mAlpha: cute.Tensor,
+        mGsfInv: cute.Tensor,
     ) -> None:
         tid, _, _ = cute.arch.thread_idx()
         raw_bid, _, _ = cute.arch.block_idx()
@@ -559,6 +559,8 @@ class _Gemm1SwigluNvfp4:
                 cute.arch.barrier(barrier_id=BAR_TMEM_ALLOC, number_of_threads=2 * 32)
 
             rcp6 = Float32(1.0 / 6.0)
+            alpha = Float32(mAlpha[0])
+            gsf_inv = Float32(mGsfInv[0])
             rcp_gsf = cute.arch.rcp_approx(gsf_inv)
 
             # (1 row x 32B) tiles over the packed output: (32B), M, I//64
@@ -754,7 +756,8 @@ class Gemm1SwigluNvfp4Kernel(VllmCuTeDSLJitKernel["Gemm1SwigluNvfp4Kernel.Compil
         SFQ = make_fake_tensor(
             Int32, (cute.sym_int(divisibility=128),), (1,), assumed_align=16
         )
-        return (A, B, SFA, SFB, Q, SFQ, Float32(1.0), Float32(1.0), Int32(1))
+        scale = make_fake_tensor(Float32, (1,), (1,), assumed_align=4)
+        return (A, B, SFA, SFB, Q, SFQ, scale, scale, Int32(1))
 
     def get_warmup_keys(
         self, n2: int, k2: int, max_m: int
@@ -790,8 +793,8 @@ def gemm1_swiglu_nvfp4(
     a_sf: torch.Tensor,
     w_fp4: torch.Tensor,
     w_sf: torch.Tensor,
-    alpha: float,
-    out_global_scale_inv: float,
+    alpha: torch.Tensor,
+    out_global_scale_inv: torch.Tensor,
     m: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused gate_up GEMM + SwiGLU + NVFP4 quant.
@@ -808,9 +811,9 @@ def gemm1_swiglu_nvfp4(
             64-row [gate, up] blocks (see interleave_gate_up_rows; applied by
             the linear kernel at weight-load time).
         w_sf: Swizzled 128x4 weight scales over the interleaved rows.
-        alpha: gate_up alpha, a static per-layer constant.
-        out_global_scale_inv: down_proj's input_global_scale_inv, a static
-            per-layer constant.
+        alpha: gate_up alpha, a 1-element fp32 device tensor.
+        out_global_scale_inv: down_proj's input_global_scale_inv, a
+            1-element fp32 device tensor.
         m: Token count; defaults to a_fp4.shape[0].
 
     Returns:
@@ -833,6 +836,9 @@ def gemm1_swiglu_nvfp4(
     assert w_sf.is_contiguous() and w_sf.nbytes == n2 * k2 * 2 // 16
     assert a_sf.is_contiguous() and a_sf.element_size() in (1, 4)
     assert a_sf.nbytes >= round_up(a_rows, 128) * k2 * 2 // 16
+    assert alpha.numel() == 1 and alpha.dtype == torch.float32
+    assert out_global_scale_inv.numel() == 1
+    assert out_global_scale_inv.dtype == torch.float32
     assert 0 <= m <= a_rows
 
     q = torch.empty((m, i // 2), dtype=torch.uint8, device=a_fp4.device)
@@ -859,8 +865,8 @@ def gemm1_swiglu_nvfp4(
         w_sf.view(torch.uint8).view(-1),
         q,
         sf.view(-1),
-        alpha,
-        out_global_scale_inv,
+        alpha.reshape(1),
+        out_global_scale_inv.reshape(1),
         grid,
     )
     return q, sf
