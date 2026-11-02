@@ -54,6 +54,13 @@ def dealloc(cta_group: int = 1, *, loc=None, ip=None) -> None:
     )
 
 
+@dsl_user_op
+def relinquish_alloc_permit(cta_group: int = 1, *, loc=None, ip=None) -> None:
+    nvvm.tcgen05_relinquish_alloc_permit(
+        group=NVVM_CTA_GROUP_MAP[cta_group], loc=loc, ip=ip
+    )
+
+
 def make_bf16_idesc(
     MMA_M: int,
     MMA_N: int,

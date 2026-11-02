@@ -219,7 +219,16 @@ class Qwen3_5RMSNorm(nn.Module):
         nvfp4 = key == kNvfp4Dynamic
         scale = linear.input_global_scale_inv if nvfp4 else linear.input_scale
         q, block_scale, y = gemma_add_rms_norm_quant(
-            x, residual, self.weight, self.variance_epsilon, scale, nvfp4, write_y
+            x,
+            residual,
+            self.weight,
+            self.variance_epsilon,
+            scale,
+            nvfp4,
+            write_y,
+            # The fused gemm1_swiglu_nvfp4 consumer reads a 128-row A tile;
+            # padding the allocation avoids TMA out-of-bounds fill at decode.
+            pad_m=nvfp4 and getattr(linear, "_gemm1_swiglu_nvfp4_interleave", False),
         )
         qa = QuantizedActivation(
             data=q,

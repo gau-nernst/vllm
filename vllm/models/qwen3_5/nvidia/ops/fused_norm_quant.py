@@ -147,6 +147,7 @@ def gemma_add_rms_norm_quant(
     scale: torch.Tensor,
     nvfp4: bool,
     write_y: bool = False,
+    pad_m: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Gemma RMSNorm of ``x (+ residual)`` quantized for the next linear.
 
@@ -160,6 +161,9 @@ def gemma_add_rms_norm_quant(
         nvfp4: quantize to NVFP4 with swizzled 128x4 block scales instead of
             static FP8.
         write_y: also return the bf16 normed activation.
+        pad_m: NVFP4 only: allocate q with round_up(M, 128) rows (matching
+            the scale coverage) so a consumer whose TMA tile spans 128 rows
+            never pays out-of-bounds fill. Rows >= M are left unwritten.
 
     Returns:
         ``(q, block_scale, y)``: quantized data (fp8, or packed fp4 uint8),
@@ -177,7 +181,11 @@ def gemma_add_rms_norm_quant(
     if nvfp4:
         # Whole 4-column scale tiles: padded scale columns are not written.
         assert H % 64 == 0
-        q = torch.empty((M, H // 2), dtype=torch.uint8, device=x.device)
+        q = torch.empty(
+            (round_up(M, 128) if pad_m else M, H // 2),
+            dtype=torch.uint8,
+            device=x.device,
+        )
         block_scale = torch.empty(
             (round_up(M, 128), round_up(H // 16, 4) // 4),
             dtype=torch.int32,

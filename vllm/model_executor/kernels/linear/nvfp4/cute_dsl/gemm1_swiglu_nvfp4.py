@@ -11,13 +11,18 @@ swizzle atom holds the gate and up rows of one 64-column output block.
 A BN=128 tile is one atom (cols [0,64) gate, [64,128) up); a BN=256 tile is
 two contiguous atoms.
 
-Configs (compile keys): (cta_group, BN, GROUP_M)
+Configs (compile keys): (cta_group, BN, GROUP_M, a_rows)
   - (2, 256, ...): m256n256 MMA, tmem acc [0,256)/[192,448) 64-col overlap,
     SFB multicast per rank. Large M.
   - (1, 128, ...): m128n128 MMA, tmem acc [0,128)/[128,256), no overlap.
     Small M: 2x the tiles of BN=256 for SM coverage.
 GROUP_M = 0: flat (m-fastest) rasterization; 32/64: grouped, when B
 exceeds half of L2.
+a_rows: 32 at m<=32, else 128. Decode is weight-streaming bound and every
+CTA re-reads the same tiny activation panel; a narrow A box cuts the TMA/L2
+overhead (MMA still spans 128 rows; rows past a_rows read stale smem and
+only feed discarded outputs). The SF tmem map packs [448, 512): 4 SFA +
+4*(BN//128) SFB cols per k-block.
 
 SFB TMA: per rank loads its own 128-row block's stage (2KB) into slot
 cta_rank, multicast to both CTAs (2-CTA config; plain copy for 1-CTA);
@@ -102,22 +107,28 @@ def _e4m3_to_f32(b: Uint32, *, loc=None, ip=None) -> Float32:
 
 
 class _Gemm1SwigluNvfp4:
-    def __init__(self, cta_group: int, BN: int, GROUP_M: int) -> None:
+    def __init__(self, cta_group: int, BN: int, GROUP_M: int, A_ROWS: int) -> None:
         BM, BK = 128, 256
+        assert A_ROWS <= BM
         self.cta_group = cta_group
+        # A (activations) is loaded with a narrower box at decode: every CTA
+        # re-reads the same tiny activation panel, so a full 128-row box is
+        # pure TMA/L2 overhead at small M. The MMA still spans BM rows; rows
+        # past A_ROWS read stale smem and only affect discarded outputs.
+        self.a_rows = A_ROWS
         self.cta_tile = (BM, BN, BK)
         self.GROUP_M = GROUP_M
         # 2-CTA: SFB is multicast and credits the mapped barrier per
         # destination CTA (2x the box). 1-CTA: single plain copy.
         sfb_blocks = 2 if cta_group == 2 else 1
         # per-stage mbarrier tx bytes: A + this rank's B/SFB copy + SFA
-        self.stage_size = (BM + BN // cta_group) * (BK // 2) + (
+        self.stage_size = (A_ROWS + BN // cta_group) * (BK // 2) + (
             BM // 128 + sfb_blocks
         ) * (BK // 64) * 512
         # per-stage smem: SFB reserves all cta_group slots
-        smem_stage = (BM + BN // cta_group) * (BK // 2) + (BM // 128 + BN // 128) * (
-            BK // 64
-        ) * 512
+        smem_stage = (A_ROWS + BN // cta_group) * (BK // 2) + (
+            BM // 128 + BN // 128
+        ) * (BK // 64) * 512
         self.num_stages = _SMEM_CAPACITY // smem_stage
 
     @cute.jit
@@ -187,7 +198,7 @@ class _Gemm1SwigluNvfp4:
             cute.make_ordered_layout((n2, k, 1), order=(1, 0, 2)),
         )
 
-        A_tma = self.prepare_AB(a_tensor, BM, BK)
+        A_tma = self.prepare_AB(a_tensor, self.a_rows, BK)
         B_tma = self.prepare_AB(b_tensor, BN // self.cta_group, BK)
         # The swizzled SFA buffer always covers round_up(M_pad, 128) rows
         # (asserted in the wrapper); the TMA descriptor must claim at least
@@ -322,7 +333,7 @@ class _Gemm1SwigluNvfp4:
             parity = 1
             tma_full_mbar_ = to_cta0_smem(tma_full_mbar)
 
-            gA_tiles = cute.zipped_divide(A_tma.tma_tensor, (BM, BK))
+            gA_tiles = cute.zipped_divide(A_tma.tma_tensor, (self.a_rows, BK))
             gB_tiles = cute.zipped_divide(B_tma.tma_tensor, (BN // cta_group, BK))
             gSFA_tiles = cute.zipped_divide(
                 SFA_tma.tma_tensor, (128 * BKsf // 8, BM // 128)
@@ -441,10 +452,12 @@ class _Gemm1SwigluNvfp4:
 
                         # gn-style interleave: each k-block's SF copies
                         # immediately precede its MMA, hiding cp latency
-                        # under MMA completion.
+                        # under MMA completion. Per k-block, SFA takes 4 tmem
+                        # cols followed by SFB's 4*BN//128, packing the SF
+                        # region [448, 512) for any BK.
                         for k in cutlass.range_constexpr(BK // 64):
-                            sfa_tmem = sfa_tmem_base + 4 * k
-                            sfb_tmem = sfa_tmem_base + 16 + sfb_cols_per_kb * k
+                            sfa_tmem = sfa_tmem_base + (4 + sfb_cols_per_kb) * k
+                            sfb_tmem = sfa_tmem + 4
                             sf_off = 32 * k  # 512B per k-block, desc units
                             _tcgen05.cp(
                                 sfa_tmem,
@@ -492,6 +505,7 @@ class _Gemm1SwigluNvfp4:
         if warp_id < 4:
             if warp_id == 0:
                 _tcgen05.alloc(taddr, cta_group)
+                _tcgen05.relinquish_alloc_permit(cta_group)
                 cute.arch.barrier(barrier_id=BAR_TMEM_ALLOC, number_of_threads=2 * 32)
 
             rcp6 = Float32(1.0 / 6.0)
@@ -626,6 +640,7 @@ class Gemm1SwigluNvfp4Kernel(VllmCuTeDSLJitKernel["Gemm1SwigluNvfp4Kernel.Compil
     class CompileKey:
         cta_group: int
         group_m: int
+        a_rows: int
 
     def dispatch(  # type: ignore[override]
         self, *, m: int, n2: int, k2: int, num_sms: int
@@ -640,13 +655,19 @@ class Gemm1SwigluNvfp4Kernel(VllmCuTeDSLJitKernel["Gemm1SwigluNvfp4Kernel.Compil
         # Grouped rasterization keeps B panels L2-resident across a wave.
         # GROUP_M counts 128-row halves for 2-CTA (64 = 32 pair-tiles).
         group_m = 64 if cta_group == 2 else (32 if n2 * k2 > (63 << 20) else 0)
-        return self.CompileKey(cta_group=cta_group, group_m=group_m)
+        # Decode is weight-streaming bound; a narrow A box cuts the TMA/L2
+        # traffic every CTA wastes re-reading the shared activation panel.
+        a_rows = 32 if m <= 32 else 128
+        return self.CompileKey(cta_group=cta_group, group_m=group_m, a_rows=a_rows)
 
     @staticmethod
     def kernel(compile_key: "Gemm1SwigluNvfp4Kernel.CompileKey"):
         cta_group = compile_key.cta_group
         return _Gemm1SwigluNvfp4(
-            cta_group, 128 if cta_group == 1 else 256, compile_key.group_m
+            cta_group,
+            128 if cta_group == 1 else 256,
+            compile_key.group_m,
+            compile_key.a_rows,
         )
 
     def warmup_inputs(self, compile_key: "Gemm1SwigluNvfp4Kernel.CompileKey"):
@@ -687,10 +708,12 @@ class Gemm1SwigluNvfp4Kernel(VllmCuTeDSLJitKernel["Gemm1SwigluNvfp4Kernel.Compil
         self, n2: int, k2: int, max_m: int
     ) -> list["Gemm1SwigluNvfp4Kernel.CompileKey"]:
         num_sms = num_compute_units()
-        # m=1 reaches the 1-CTA config, max_m the 2-CTA one.
+        # m=1 and m=128 reach the 1-CTA configs (narrow and full A box),
+        # max_m the 2-CTA one.
         return list(
             dict.fromkeys(
-                self.dispatch(m=m, n2=n2, k2=k2, num_sms=num_sms) for m in (1, max_m)
+                self.dispatch(m=m, n2=n2, k2=k2, num_sms=num_sms)
+                for m in (1, 128, max_m)
             )
         )
 
