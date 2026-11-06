@@ -21,6 +21,8 @@ EAGLE3_DRAFT = (
 )
 LLAMA3_TARGET = "unsloth/Meta-Llama-3.1-8B-Instruct"  # max_position_embeddings=131072
 HYBRID_MODEL = "ai21labs/Jamba-tiny-random"  # hybrid Mamba/attention
+# MTP target whose max_position_embeddings lives in a nested text_config.
+MTP_TARGET = "Qwen/Qwen3.8-Flash-Next"
 
 
 @pytest.mark.cpu_test
@@ -75,6 +77,46 @@ def test_eagle_draft_limits_max_model_len_unless_resized(
     draft_hf_config = speculative_config.draft_model_config.hf_config
     assert draft_hf_config.max_position_embeddings == (8192 if resizable else 2048)
     assert vllm_config.model_config.max_model_len == (8192 if resizable else 2048)
+
+
+@pytest.mark.cpu_test
+def test_yarn_mtp_draft_does_not_limit_max_model_len(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An MTP draft that inherits the target's YaRN overrides builds its
+    cos/sin cache from original_max_position_embeddings * factor; when that
+    covers the target's max_model_len the draft must not clamp it, even
+    though its own max_position_embeddings stays at the native window
+    (#62383)."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    yarn_overrides = {
+        "text_config": {
+            "rope_parameters": {
+                "mrope_interleaved": True,
+                "mrope_section": [11, 11, 10],
+                "rope_type": "yarn",
+                "rope_theta": 10000000,
+                "partial_rotary_factor": 0.25,
+                "factor": 4.0,
+                "original_max_position_embeddings": 262144,
+            }
+        }
+    }
+    model_config = ModelConfig(
+        MTP_TARGET, max_model_len=1000000, hf_overrides=yarn_overrides
+    )
+    speculative_config = SpeculativeConfig(
+        target_model_config=model_config,
+        target_parallel_config=ParallelConfig(),
+        method="mtp",
+        num_speculative_tokens=3,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config, speculative_config=speculative_config
+    )
+    assert vllm_config.use_v2_model_runner
+    assert vllm_config.model_config.max_model_len == 1000000
 
 
 @pytest.mark.cpu_test

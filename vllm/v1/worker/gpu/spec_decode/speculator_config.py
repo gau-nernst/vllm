@@ -160,13 +160,23 @@ class DraftModelSpeculatorConfig(SpeculatorConfig):
 
     @property
     def max_model_len(self) -> int | None:
-        from vllm.config.speculative import _rope_only_sizes_cache
+        from vllm.config.speculative import (
+            _rope_only_sizes_cache,
+            _scaled_rope_cache_covers,
+        )
 
         draft = self.spec_config.draft_model_config
+        # Its max_position_embeddings was raised to the target's, or its
+        # scaling rope's cache already covers the target's window.
         if draft is None or (
-            # Its max_position_embeddings was raised to the target's.
             self.shares_target_positions
-            and _rope_only_sizes_cache(draft.hf_text_config)
+            and (
+                _rope_only_sizes_cache(draft.hf_text_config)
+                or _scaled_rope_cache_covers(
+                    draft.hf_text_config,
+                    self.spec_config.target_model_config.max_model_len,
+                )
+            )
         ):
             return None
         return draft.max_model_len

@@ -162,6 +162,30 @@ def _rope_only_sizes_cache(hf_config: PreTrainedConfig) -> bool:
     )
 
 
+def _scaled_rope_cache_covers(hf_config: PreTrainedConfig, max_model_len: int) -> bool:
+    """True if every declared rope is a YaRN-family scaling type whose cache
+    (sized from original_max_position_embeddings * factor) covers
+    max_model_len. Such a draft can serve the target's window as-is, so it
+    must not clamp max_model_len even though its max_position_embeddings is
+    not raised (raising it would change the encoding, not just the cache)."""
+    saw_rope = False
+    for params in iter_rope_parameters(hf_config):
+        if params.get("rope_type", "default") not in (
+            "yarn",
+            "deepseek_yarn",
+            "deepseek_llama_scaling",
+        ):
+            return False
+        original = params.get("original_max_position_embeddings")
+        factor = params.get("factor")
+        if not original or not factor:
+            return False
+        saw_rope = True
+        if original * factor < max_model_len:
+            return False
+    return saw_rope
+
+
 _MINIMAX_M3_MODEL_TYPES = ("minimax_m3_vl", "minimax_m3_text")
 _MINIMAX_M3_DSPARK_SUBFOLDER = "dspark"
 
