@@ -29,8 +29,6 @@ from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.speculative import SpeculativeConfig
 
-
-
 _YARN_ROPE_PARAMETERS = {
     "mrope_interleaved": True,
     "mrope_section": [11, 11, 10],
@@ -95,6 +93,8 @@ def _make_speculative_config(
     hf_config = SpeculativeConfig.hf_config_override(_make_hf_config(**hf_kwargs))
     draft = MagicMock(
         hf_config=hf_config,
+        # Flat config: the text config is the config itself.
+        hf_text_config=hf_config,
         architectures=hf_config.architectures,
         max_model_len=128,
         # Self-contained DSpark draft models declare their speculator.
@@ -250,7 +250,6 @@ def test_mtp_stages_are_independent_of_dspark_width():
         _make_speculative_config(
             hf_kwargs, "DeepSeekV4MTPModel", method="mtp", num_speculative_tokens=5
         )
-
 
 
 @pytest.mark.cpu_test
@@ -432,6 +431,8 @@ def _make_mtp_speculative_config(
     draft_model_config = MagicMock(
         model="draft",
         hf_config=draft_hf_config,
+        # Flat config: the text config is the config itself.
+        hf_text_config=draft_hf_config,
         architectures=draft_hf_config.architectures,
         max_model_len=128,
         speculator_config_class=None,

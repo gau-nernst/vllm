@@ -37,6 +37,8 @@ DFLASH_DRAFT = "z-lab/Qwen3-4B-DFlash-b16"  # max_position_embeddings=40960
 DFLASH_TARGET = "Qwen/Qwen3-4B"  # max_position_embeddings=40960
 DSPARK_DRAFT = "deepseek-ai/dspark_qwen3_8b_block7"  # max_position_embeddings=40960
 DSPARK_TARGET = "Qwen/Qwen3-8B"  # max_position_embeddings=40960
+# Wraps max_position_embeddings=262144 in a nested text_config.
+MTP_TARGET = "Qwen/Qwen3.8-Flash-Next"
 
 _LOGGER = "vllm.config.speculative"
 _OVERRIDE_MSG = "Overriding draft model max_position_embeddings"
@@ -202,6 +204,33 @@ def test_dflash_draft_inherits_target_max_model_len(
     )
     draft_hf_config = speculative_config.draft_model_config.hf_config
     assert draft_hf_config.max_position_embeddings == 65536
+    assert _override_logged(vllm_caplog)
+
+
+@pytest.mark.cpu_test
+def test_mtp_draft_inherits_target_max_model_len(
+    vllm_caplog: pytest.LogCaptureFixture,
+):
+    """An MTP draft gets none of the target's dict hf_overrides, and a
+    nested-config target keeps max_position_embeddings in its text_config.
+    Both the read and the write of the override must use that nested config,
+    or the draft's rotary cache stays sized for the native window while the
+    proposer feeds it the target's positions (#62383)."""
+    target_model_config = ModelConfig(
+        MTP_TARGET,
+        hf_overrides={"text_config": {"max_position_embeddings": 524288}},
+    )
+    assert target_model_config.max_model_len == 524288
+    speculative_config = SpeculativeConfig(
+        target_model_config=target_model_config,
+        target_parallel_config=ParallelConfig(),
+        method="mtp",
+        num_speculative_tokens=3,
+    )
+    draft_model_config = speculative_config.draft_model_config
+    draft_text_config = draft_model_config.hf_text_config
+    assert draft_model_config.hf_config is not draft_text_config
+    assert draft_text_config.max_position_embeddings == 524288
     assert _override_logged(vllm_caplog)
 
 
