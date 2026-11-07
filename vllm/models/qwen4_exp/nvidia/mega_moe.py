@@ -31,10 +31,15 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
     kMxfp4Static,
     kMxfp8Dynamic,
+    kMxfp8Static,
 )
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
 from vllm.platforms import current_platform
@@ -53,10 +58,11 @@ _REQUANTIZE_CHUNK_ELEMENTS = 1 << 27
 
 def requantize_fp8_block(
     weight: torch.Tensor,
-    weight_scale_inv: torch.Tensor,
+    weight_scale_inv: torch.Tensor | None,
     weight_format: MegaMoEWeightFormat,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Requantize ``[N, K]`` block-FP8 weights to MXFP8 or MXFP4.
+    """Requantize ``[N, K]`` block-FP8 (or BF16 when ``weight_scale_inv`` is
+    None) weights to MXFP8 or MXFP4.
 
     Rounds as DeepGEMM's ``per_token_cast_to_fp8`` / ``per_token_cast_to_fp4``
     and returns the scales as ``[N, K // 32]`` UE8M0 exponents. Rows are
@@ -69,10 +75,13 @@ def requantize_fp8_block(
         else "per_token_cast_to_fp8"
     )
     cast = getattr(import_module(f"{_import_deep_gemm().__name__}.utils"), cast)
-    scale = weight_scale_inv.float()
-    scale = scale.repeat_interleave(rows // scale.shape[0], 0)
-    scale = scale.repeat_interleave(cols // scale.shape[1], 1)
-    values, sf = cast(weight.float() * scale, use_ue8m0=True, gran_k=_MX_GROUP)
+    weight = weight.float()
+    if weight_scale_inv is not None:
+        scale = weight_scale_inv.float()
+        scale = scale.repeat_interleave(rows // scale.shape[0], 0)
+        scale = scale.repeat_interleave(cols // scale.shape[1], 1)
+        weight = weight * scale
+    values, sf = cast(weight, use_ue8m0=True, gran_k=_MX_GROUP)
     # Power-of-two FP32 scales: the exponent bits are the UE8M0 value.
     return values, (sf.view(torch.int32) >> 23).to(torch.uint8)
 
@@ -80,6 +89,21 @@ def requantize_fp8_block(
 def mega_moe_weight_format(vllm_config: VllmConfig, prefix: str) -> MegaMoEWeightFormat:
     """MXFP8 unless ``--quantization-config`` resolves MXFP4 for ``prefix``."""
     quant_config = vllm_config.quant_config
+    # BF16 checkpoint: the MTP drafter gets no quant config, the main model gets
+    # the online config from `--quantization online --quantization-config`.
+    if quant_config is None:
+        return MEGA_MOE_MXFP8
+    if isinstance(quant_config, OnlineQuantizationConfig):
+        return _online_weight_format(quant_config, quant_config, prefix)
+    # MXFP8 checkpoint (`quant_method: "mxfp8"`): experts are stored in MegaMoE's own
+    # layout (E4M3 values + UE8M0 scales per 32 along K) and load without requantizing.
+    if isinstance(quant_config, ModelOptMxFp8Config):
+        if quant_config.is_layer_excluded(prefix):
+            raise NotImplementedError(
+                f"Qwen4Exp MegaMoE requires MXFP8 experts; the checkpoint leaves "
+                f"{prefix} unquantized."
+            )
+        return MEGA_MOE_MXFP8
     if not (
         isinstance(quant_config, Fp8Config)
         and quant_config.weight_block_size == [128, 128]
@@ -102,13 +126,19 @@ def mega_moe_weight_format(vllm_config: VllmConfig, prefix: str) -> MegaMoEWeigh
     online_config = quant_config.online_quantization_config
     if online_config is None:
         return MEGA_MOE_MXFP8
+    return _online_weight_format(quant_config, online_config, prefix)
+
+
+def _online_weight_format(
+    quant_config, online_config, prefix: str
+) -> MegaMoEWeightFormat:
     resolved = online_config.resolve_quant_method_cls(RoutedExperts, prefix)
     if resolved is None:
         return MEGA_MOE_MXFP8
     source, quant_key_str, target_pattern, spec, _ = resolved
     if spec.weight == kMxfp4Static:
         weight_format = MEGA_MOE_MXFP4
-    elif spec.weight == kMxfp8Dynamic:
+    elif spec.weight in (kMxfp8Dynamic, kMxfp8Static):
         weight_format = MEGA_MOE_MXFP8
     else:
         raise NotImplementedError(
@@ -179,9 +209,14 @@ class Qwen4ExpMegaMoEExperts(DeepGemmMegaMoEExperts):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load ``{expert}.{gate,up,down}_proj.{weight,weight_scale_inv}``."""
+        """Load ``{expert}.{gate,up,down}_proj.{weight,weight_scale_inv}`` (block FP8,
+        requantized), ``{expert}.{proj}.{weight,weight_scale}`` (MXFP8, as is) or fused
+        BF16 ``gate_up_proj`` / ``down_proj`` (quantized)."""
         loaded: set[str] = set()
         for name, tensor in weights:
+            if name in ("gate_up_proj", "down_proj"):
+                loaded.update(self._stage_bf16_fused(name, tensor))
+                continue
             expert, proj, kind = name.split(".")
             expert_id, shard_id = int(expert), _CHECKPOINT_SHARDS[proj]
             prefix = "w2" if shard_id == "w2" else "w13"
@@ -195,11 +230,65 @@ class Qwen4ExpMegaMoEExperts(DeepGemmMegaMoEExperts):
             if len(pending) < 2:
                 continue
             del self._pending_shards[(expert_id, shard_id)]
+            if "weight_scale" in pending:
+                self._load_mxfp8(
+                    expert_id, shard_id, pending["weight"], pending["weight_scale"]
+                )
+                continue
             ready = self._ready_shards.setdefault(shard_id, [])
             ready.append((expert_id, pending["weight"], pending["weight_scale_inv"]))
             if len(ready) == self._num_owned_experts:
                 self._requantize_ready(shard_id)
         return loaded
+
+    def _load_mxfp8(
+        self, expert_id: int, shard_id: str, weight: torch.Tensor, scale: torch.Tensor
+    ) -> None:
+        """Copy one pre-quantized MXFP8 expert projection into the MegaMoE buffers."""
+        if self.weight_format is not MEGA_MOE_MXFP8:
+            raise NotImplementedError(
+                f"{self.prefix}: an MXFP8 checkpoint cannot be served as "
+                f"{self.weight_format.name}."
+            )
+        if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.uint8:
+            raise ValueError(
+                f"{self.prefix}: expected float8_e4m3fn weights and uint8 (UE8M0) "
+                f"scales, got {weight.dtype} and {scale.dtype}."
+            )
+        if scale.shape != (weight.shape[0], weight.shape[1] // _MX_GROUP):
+            raise ValueError(
+                f"{self.prefix}: scale shape {tuple(scale.shape)} does not match "
+                f"weight shape {tuple(weight.shape)} with groups of {_MX_GROUP}."
+            )
+        prefix = "w2" if shard_id == "w2" else "w13"
+        for suffix, value in (("weight", weight), ("weight_scale", scale)):
+            param_name = f"{prefix}_{suffix}"
+            param = getattr(self, param_name)
+            param.weight_loader(
+                param, value, param_name, shard_id=shard_id, expert_id=expert_id
+            )
+
+    def _stage_bf16_fused(self, name: str, tensor: torch.Tensor) -> set[str]:
+        """Stage a BF16 ``[E, N, K]`` fused tensor (gate stacked above up)."""
+        assert tensor.dim() == 3 and tensor.shape[0] == self.num_logical_experts, (
+            f"{self.prefix}.{name}: unexpected fused shape {tuple(tensor.shape)}"
+        )
+        owned = [
+            e for e in range(self.num_logical_experts) if self._map_global_expert_id(e)
+        ]
+        local = tensor[owned].to(self._requantize_device)
+        if name == "down_proj":
+            shards = {"w2": local}
+        else:
+            gate, up = local.chunk(2, dim=1)
+            shards = {"w1": gate, "w3": up}
+        for shard_id, value in shards.items():
+            self._ready_shards[shard_id] = [
+                (e, value[i], None) for i, e in enumerate(owned)
+            ]
+            self._requantize_ready(shard_id)
+        prefix = "w2" if name == "down_proj" else "w13"
+        return {f"{prefix}_weight", f"{prefix}_weight_scale"}
 
     def flush_requantize(self, strict: bool = False) -> None:
         for shard_id in list(self._ready_shards):
@@ -221,7 +310,7 @@ class Qwen4ExpMegaMoEExperts(DeepGemmMegaMoEExperts):
             batch = ready[start : start + chunk]
             weight, scale = requantize_fp8_block(
                 torch.cat([w for _, w, _ in batch]),
-                torch.cat([s for _, _, s in batch]),
+                None if batch[0][2] is None else torch.cat([s for _, _, s in batch]),
                 self.weight_format,
             )
             for i, (expert_id, _, _) in enumerate(batch):

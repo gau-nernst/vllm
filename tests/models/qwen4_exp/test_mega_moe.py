@@ -91,8 +91,11 @@ def test_weight_format_follows_quantization_config():
     assert mega_moe_weight_format(config, prefix) is MEGA_MOE_MXFP8
     with pytest.raises(NotImplementedError, match="mxfp8 or mxfp4"):
         mega_moe_weight_format(_quant_config(moe="fp8_per_tensor"), prefix)
-    with pytest.raises(NotImplementedError, match="block-FP8"):
+    # BF16 checkpoint (e.g. the MTP drafter, which gets no quant config).
+    assert (
         mega_moe_weight_format(SimpleNamespace(quant_config=None), prefix)
+        is MEGA_MOE_MXFP8
+    )
     with pytest.raises(NotImplementedError, match="leaves .* unquantized"):
         mega_moe_weight_format(_quant_config(ignored_layers=[prefix]), prefix)
 

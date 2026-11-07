@@ -1182,6 +1182,16 @@ def get_draft_quant_config(vllm_config: VllmConfig) -> "QuantizationConfig | Non
     draft_model_config = speculative_config.draft_model_config
     draft_load_config = vllm_config.load_config
 
+    # Online quantization of a full-precision checkpoint: the draft config does not
+    # carry `--quantization-config`, so there is nothing to build; the draft stays
+    # unquantized (its layers may still pick their own format, e.g. MegaMoE MXFP8).
+    if (
+        draft_model_config is not None
+        and draft_model_config.quantization == "online"
+        and draft_model_config.quantization_config is None
+    ):
+        return None
+
     return (
         VllmConfig.get_quantization_config(draft_model_config, draft_load_config)
         if draft_model_config
