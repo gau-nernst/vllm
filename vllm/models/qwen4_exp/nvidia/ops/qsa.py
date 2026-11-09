@@ -58,6 +58,60 @@ def _maybe_dequant(tile):
         return tile
 
 
+@triton.jit
+def _e4m3_pairs_to_fp16(pairs, HIGH: tl.constexpr):
+    """fp16 of one byte of each int16 pair of e4m3 codes (byte 0 = dim 2i,
+    byte 1 = dim 2i + 1); exact."""
+    if HIGH:
+        return tl.inline_asm_elementwise(
+            asm="""
+            {
+            .reg .b32 t;
+            .reg .b16 lo, hi;
+            prmt.b32 t, $1, 0, 0x3120;
+            mov.b32 {lo, hi}, t;
+            cvt.rn.f16x2.e4m3x2 $0, hi;
+            }
+            """,
+            constraints="=r,r",
+            args=[pairs],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=2,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            asm="""
+            {
+            .reg .b32 t;
+            .reg .b16 lo, hi;
+            prmt.b32 t, $1, 0, 0x3120;
+            mov.b32 {lo, hi}, t;
+            cvt.rn.f16x2.e4m3x2 $0, lo;
+            }
+            """,
+            constraints="=r,r",
+            args=[pairs],
+            dtype=tl.float16,
+            is_pure=True,
+            pack=2,
+        )
+
+
+@triton.jit
+def _add_unfused(a, b):
+    # An fp32 add the dot combiner cannot fold into one accumulator chain, so
+    # the two QK MMA chains stay independent.
+    return tl.inline_asm_elementwise(
+        asm="add.f32 $0, $1, $2;",
+        constraints="=r,r,r",
+        args=[a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
 @lru_cache(maxsize=1)
 def _is_sm80() -> bool:
     """True on sm_80 (A100/A30): selects the wide FP8 byte-decode tiles."""
@@ -68,6 +122,12 @@ def _is_sm80() -> bool:
 def _is_sm90() -> bool:
     """True on sm_90 (H100/H200/H20): selects the sm_90 tuning table."""
     return current_platform.get_device_capability() == (9, 0)
+
+
+@lru_cache(maxsize=1)
+def _is_sm100_family() -> bool:
+    """True on sm_100/sm_103 (B200/B300): enables int16-pair fp8 loads."""
+    return current_platform.is_device_capability_family(100)
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_requests"])
@@ -111,6 +171,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PAIR_LOADS: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -128,18 +189,33 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     dim_offsets = tl.arange(0, HEAD_DIM)
     column_offsets = tl.arange(0, BLOCK_N)
     first_head = kv_head * GROUP_SIZE
-    query = tl.load(
-        q_ptr
-        + row * stride_q_row
-        + (first_head + head_offsets[:, None]) * stride_q_head
-        + dim_offsets[None, :],
-        mask=head_offsets[:, None] < GROUP_SIZE,
-        other=0.0,
-    )
+    if PAIR_LOADS:
+        # int16 pairs of e4m3 codes: even/odd dims form two half-dots.
+        pair_offsets = tl.arange(0, HEAD_DIM // 2)
+        q_pairs = (
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + 2 * pair_offsets[None, :]
+        )
+        pair_mask = head_offsets[:, None] < GROUP_SIZE
+        query_even = tl.load(q_pairs, mask=pair_mask, other=0.0)
+        query_odd = tl.load(q_pairs + 1, mask=pair_mask, other=0.0)
+        acc_even = tl.zeros((BLOCK_M, HEAD_DIM // 2), dtype=tl.float32)
+        acc_odd = tl.zeros((BLOCK_M, HEAD_DIM // 2), dtype=tl.float32)
+    else:
+        query = tl.load(
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + dim_offsets[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
+        accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     # softmax_scale is the host-side attention scale (1/sqrt(head_dim), with the
     # fp8 K dequant scale already pre-multiplied in); convert to log2 units once
     # here for the exp2-based online softmax.
@@ -173,32 +249,65 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
-        # measured slower here and less accurate).
-        keys = _maybe_dequant(keys).to(query.dtype)
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
-        # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
-        # softmax) so fp16 has the range, its wider mantissa is more
-        # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
-        values = _maybe_dequant(values)
-        scores = tl.dot(query, keys)
+        if PAIR_LOADS:
+            # Cache rows start on 16 bytes (the launcher checks the strides).
+            token_offset = tl.multiple_of(
+                safe_page * stride_k_block + page_offset * stride_k_token, 8
+            )
+            pair_ptrs = token_offset[:, None] + pair_offsets[None, :]
+            key_pairs = tl.trans(
+                tl.load(
+                    k_cache_ptr + kv_head * stride_k_head + pair_ptrs,
+                    mask=valid[:, None],
+                    other=0,
+                )
+            )
+            # e4m3 -> bf16 is exact, so the bf16 half-dots multiply the same
+            # values as the byte path's full dot; only fp32 summation regroups.
+            keys_even = _e4m3_pairs_to_fp16(key_pairs, False).to(tl.bfloat16)
+            keys_odd = _e4m3_pairs_to_fp16(key_pairs, True).to(tl.bfloat16)
+            scores = _add_unfused(
+                tl.dot(query_even, keys_even), tl.dot(query_odd, keys_odd)
+            )
+            value_pairs = tl.load(
+                v_cache_ptr
+                + kv_head * stride_v_head
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + pair_offsets[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            # fp16 (not bf16) for the PV dot, as in the byte path.
+            values_even = _e4m3_pairs_to_fp16(value_pairs, False)
+            values_odd = _e4m3_pairs_to_fp16(value_pairs, True)
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
+            # measured slower here and less accurate).
+            keys = _maybe_dequant(keys).to(query.dtype)
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
+            # Dequant V to fp16 (not bf16) for the PV dot: P <= 1 (online
+            # softmax) so fp16 has the range, its wider mantissa is more
+            # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
+            values = _maybe_dequant(values)
+            scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
         # caches the K dequant scale is already folded into softmax_scale on the
         # host.
@@ -209,11 +318,24 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
+        if PAIR_LOADS:
+            probabilities_fp16 = probabilities.to(tl.float16)
+            acc_even = tl.dot(
+                probabilities_fp16,
+                values_even,
+                acc=acc_even * alpha[:, None],
+            )
+            acc_odd = tl.dot(
+                probabilities_fp16,
+                values_odd,
+                acc=acc_odd * alpha[:, None],
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
@@ -223,11 +345,23 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     # HEAD_DIM-wide scale. The split-K LSE below keeps the unscaled normalizer,
     # so the merge stays correct.
     inv_normalizer = output_scale / tl.maximum(normalizer, 1.0e-20)
-    normalized_output = tl.where(
-        has_values[:, None],
-        accumulator * inv_normalizer[:, None],
-        0.0,
-    )
+    if PAIR_LOADS:
+        # Reassemble the even/odd dim streams: join interleaves the halves.
+        output_even = tl.where(
+            has_values[:, None], acc_even * inv_normalizer[:, None], 0.0
+        )
+        output_odd = tl.where(
+            has_values[:, None], acc_odd * inv_normalizer[:, None], 0.0
+        )
+        normalized_output = tl.reshape(
+            tl.join(output_even, output_odd), (BLOCK_M, HEAD_DIM)
+        )
+    else:
+        normalized_output = tl.where(
+            has_values[:, None],
+            accumulator * inv_normalizer[:, None],
+            0.0,
+        )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
         # Preserve the unfused path's BF16 attention-output rounding before
@@ -588,6 +722,7 @@ def _select_config(
     use_prefill_config: bool,
     num_columns: int,
     is_fp8: bool = False,
+    pair_loads: bool = False,
 ) -> tuple[int, int, int, int]:
     """Select (block_n, num_warps, num_tiles, num_splits) for the kernel.
 
@@ -595,7 +730,8 @@ def _select_config(
     on use_prefill_config (capture-stable: at FULL-graph capture max_query_len is
     the uniform decode/verify length). This default table was tuned on GB300;
     sm_120 (RTX PRO 6000 Blackwell) dispatches to _select_sm120_config instead,
-    and sm_90 (Hopper) to _select_sm90_config.
+    and sm_90 (Hopper) to _select_sm90_config. pair_loads (int16-pair fp8 loads)
+    shifts the large-batch decode entries to wider tiles with more warps.
     """
     base_programs = num_rows * num_kv_heads
     if _is_sm120():
@@ -608,7 +744,9 @@ def _select_config(
         )
     elif base_programs > 2048:
         BLOCK_N, target_splits, num_warps = (
-            (32, 1, 1) if use_prefill_config else (64, 1, 2)
+            (32, 1, 1)
+            if use_prefill_config
+            else ((128, 1, 4) if pair_loads else (64, 1, 2))
         )
     elif base_programs <= 24:
         BLOCK_N, target_splits, num_warps = 32, 64, 4
@@ -623,7 +761,8 @@ def _select_config(
     elif base_programs <= 512:
         BLOCK_N, target_splits, num_warps = 64, 4, 2
     else:
-        BLOCK_N, target_splits, num_warps = 64, 1, 2
+        # int16-pair loads measured fastest at wider tiles with more warps.
+        BLOCK_N, target_splits, num_warps = (128, 1, 4) if pair_loads else (64, 1, 2)
     if is_fp8 and _is_sm80():
         # Wider tiles measured faster for the byte-decode path on A100;
         # unmeasured on sm_86, which keeps the table's tiles.
@@ -721,8 +860,39 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
+
+    # fp8 decode/verify batches on Blackwell load K/V as int16 pairs of e4m3
+    # codes: 16-bit granularity through the pipelined loads instead of
+    # byte-wise shared-memory reads. Prefill keeps the byte path, as do small
+    # batches: measured on GB200, pairs lose below ~256 (row, KV-head)
+    # programs (narrow split-heavy tiles) and win ~1.7-2.1x above.
+    pair_loads = (
+        is_fp8
+        and k_cache.dtype == torch.float8_e4m3fn
+        and not use_prefill_config
+        and _is_sm100_family()
+        and q.shape[0] * k_cache.shape[2] > 256
+    )
+    if pair_loads:
+        k_in = k_cache.view(torch.int16)
+        v_in = v_cache.view(torch.int16)
+        # The pair gathers' vector width relies on 16-byte cache rows.
+        pair_loads = (
+            k_in.stride(0) % 8 == 0
+            and k_in.stride(1) % 8 == 0
+            and v_in.stride(0) == k_in.stride(0)
+            and v_in.stride(1) == k_in.stride(1)
+        )
+    if not pair_loads:
+        k_in, v_in = k_cache, v_cache
+
     block_n, partial_warps, num_tiles, num_splits = _select_config(
-        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
+        q.shape[0],
+        k_cache.shape[2],
+        use_prefill_config,
+        selection_width,
+        is_fp8,
+        pair_loads,
     )
 
     # Split=1 writes output directly and compiles out all workspace accesses.
@@ -744,8 +914,8 @@ def qsa_sparse_paged_attention(
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
-        k_cache,
-        v_cache,
+        k_in,
+        v_in,
         logical_indices,
         block_table,
         token_to_req,
@@ -757,12 +927,12 @@ def qsa_sparse_paged_attention(
         output_gate_view,
         q.stride(0),
         q.stride(1),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
+        k_in.stride(0),
+        k_in.stride(1),
+        k_in.stride(2),
+        v_in.stride(0),
+        v_in.stride(1),
+        v_in.stride(2),
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -782,6 +952,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        PAIR_LOADS=pair_loads,
         num_warps=partial_warps,
         num_stages=2,
     )
@@ -814,7 +985,7 @@ def warmup_qsa_sparse_paged_attention(
     *,
     num_query_heads: int,
     selection_width: int,
-) -> tuple[tuple[int, int, int], ...]:
+) -> tuple[tuple[int, int, int, bool], ...]:
     """Compile every production-reachable split-K/merge specialization."""
     head_dim = kv_cache.shape[-1] // 2
     key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
@@ -830,14 +1001,30 @@ def warmup_qsa_sparse_paged_attention(
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
+    # Mirror the launcher's pair-loads gate (fp8 decode on sm_100+, >256
+    # (row, KV-head) programs).
+    pair_loads = cache_dtype == torch.float8_e4m3fn and _is_sm100_family()
 
     # Every config the dispatch can pick for this group size.
     profiles = {
-        _select_config(
-            num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
+        (
+            *_select_config(
+                num_rows,
+                num_kv_heads,
+                use_prefill_config,
+                selection_width,
+                is_fp8,
+                pairs,
+            ),
+            pairs,
         )
         for num_rows in range(1, 8193)
         for use_prefill_config in (False, True)
+        for pairs in (
+            (False, True)
+            if (pair_loads and not use_prefill_config and num_rows * num_kv_heads > 256)
+            else (False,)
+        )
     }
 
     # Scalars constant per deployment get their real values (their divisibility
@@ -857,6 +1044,17 @@ def warmup_qsa_sparse_paged_attention(
         cache_dtype,
         shape=tuple(value_cache.shape),
         strides=tuple(value_cache.stride()),
+    )
+    # int16-pair views of the cache (halved width; strides in int16 units).
+    k_pairs_ptr = TritonWarmupTensor(
+        torch.int16,
+        shape=(*key_cache.shape[:3], head_dim // 2),
+        strides=tuple(s // 2 for s in key_cache.stride()[:3]) + (1,),
+    )
+    v_pairs_ptr = TritonWarmupTensor(
+        torch.int16,
+        shape=(*value_cache.shape[:3], head_dim // 2),
+        strides=tuple(s // 2 for s in value_cache.stride()[:3]) + (1,),
     )
     # +1: the packed buffer's trailing count column.
     indices_ptr = TritonWarmupTensor(torch.int32, shape=(num_rows, selection_width + 1))
@@ -878,7 +1076,7 @@ def warmup_qsa_sparse_paged_attention(
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
 
     warmed = []
-    for block_n, warps, num_tiles, num_splits in sorted(profiles):
+    for block_n, warps, num_tiles, num_splits, pairs in sorted(profiles):
         if num_splits == 1:
             partial_output_ptr = output_ptr
             partial_lse_ptr = output_ptr
@@ -890,10 +1088,18 @@ def warmup_qsa_sparse_paged_attention(
             partial_lse_ptr = TritonWarmupTensor(
                 torch.float32, shape=(num_splits, num_rows, num_query_heads)
             )
+        if pairs:
+            k_arg, v_arg = k_pairs_ptr, v_pairs_ptr
+            k_strides = [s // 2 for s in key_cache.stride()[:3]]
+            v_strides = [s // 2 for s in value_cache.stride()[:3]]
+        else:
+            k_arg, v_arg = k_cache_ptr, v_cache_ptr
+            k_strides = key_cache.stride()[:3]
+            v_strides = value_cache.stride()[:3]
         _qsa_sparse_paged_gqa_splitk_kernel.warmup(
             q_ptr,
-            k_cache_ptr,
-            v_cache_ptr,
+            k_arg,
+            v_arg,
             indices_ptr,
             block_table_ptr,
             token_to_req_ptr,
@@ -905,12 +1111,8 @@ def warmup_qsa_sparse_paged_attention(
             output_gate_ptr,
             row_stride,
             head_stride,
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            value_cache.stride(2),
+            *k_strides,
+            *v_strides,
             selection_width + 1,
             block_table.stride(0),
             row_stride,
@@ -930,6 +1132,7 @@ def warmup_qsa_sparse_paged_attention(
             NUM_TILES=num_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            PAIR_LOADS=pairs,
             num_warps=warps,
             num_stages=2,
             grid=(num_rows, num_kv_heads, num_splits),
@@ -953,7 +1156,7 @@ def warmup_qsa_sparse_paged_attention(
                 num_stages=1,
                 grid=(num_rows, num_query_heads),
             )
-        warmed.append((block_n, num_splits, warps))
+        warmed.append((block_n, num_splits, warps, pairs))
     return tuple(warmed)
 
 

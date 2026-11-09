@@ -1137,6 +1137,109 @@ def test_qsa_sparse_paged_attention_correctness(
 
 
 @requires_qsa_kernels
+@pytest.mark.skipif(
+    not current_platform.has_device_capability(89),
+    reason="int16-pair loads need the native fp8 cache path (sm_89+)",
+)
+def test_qsa_pair_loads_match_byte_path() -> None:
+    """int16-pair K/V loads (the fp8 decode path on sm_100+) vs the byte path.
+
+    e4m3 -> fp16/bf16 conversions are exact, so both paths multiply identical
+    values; only the fp32 summation regroups, so outputs agree except for
+    last-ulp differences on a small fraction of elements.
+    """
+    from vllm.triton_utils import triton
+
+    torch.manual_seed(3)
+    rows, num_query_heads, num_kv_heads, head_dim = 64, 24, 2, 256
+    page_size, pages_per_request = 1920, 33
+    num_requests = 16
+    num_blocks = num_requests * pages_per_request
+    selection_width = 2051
+    block_n = 128
+
+    kv_cache = torch.randn(
+        num_blocks, page_size, num_kv_heads, 2 * head_dim, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
+    q = torch.randn(rows, num_query_heads, head_dim, device="cuda").to(torch.bfloat16)
+    output_gate = torch.randn_like(q)
+    block_table = (
+        torch.randperm(num_blocks, device="cuda")
+        .reshape(num_requests, pages_per_request)
+        .to(torch.int32)
+    )
+    token_to_req = torch.repeat_interleave(
+        torch.arange(num_requests, device="cuda", dtype=torch.int32), 4
+    )
+    logical_indices = torch.randint(
+        0, pages_per_request * page_size, (rows, selection_width), device="cuda"
+    ).to(torch.int32)
+    counts = torch.full((rows, 1), selection_width, device="cuda", dtype=torch.int32)
+    logical_indices = torch.cat([logical_indices, counts], dim=1)
+
+    k_scale, v_scale = 0.5, 2.0
+    num_tiles = triton.cdiv(selection_width, block_n)
+
+    def launch(pair_loads: bool, out: torch.Tensor) -> None:
+        k_in = k_cache.view(torch.int16) if pair_loads else k_cache
+        v_in = v_cache.view(torch.int16) if pair_loads else v_cache
+        qsa_ops._qsa_sparse_paged_gqa_splitk_kernel[(rows, num_kv_heads, 1)](
+            q,
+            k_in,
+            v_in,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+            out,
+            out,
+            head_dim**-0.5 * k_scale,
+            v_scale,
+            output_gate.view_as(q),
+            q.stride(0),
+            q.stride(1),
+            k_in.stride(0),
+            k_in.stride(1),
+            k_in.stride(2),
+            v_in.stride(0),
+            v_in.stride(1),
+            v_in.stride(2),
+            logical_indices.stride(0),
+            block_table.stride(0),
+            out.stride(0),
+            out.stride(1),
+            q.stride(0),
+            q.stride(1),
+            rows,
+            num_blocks,
+            num_requests,
+            TOPK=selection_width,
+            PAGE_SIZE=page_size,
+            PAGE_TABLE_WIDTH=pages_per_request,
+            GROUP_SIZE=num_query_heads // num_kv_heads,
+            HEAD_DIM=head_dim,
+            NUM_QUERY_HEADS=num_query_heads,
+            NUM_SPLITS=1,
+            NUM_TILES=num_tiles,
+            BLOCK_M=triton.next_power_of_2(num_query_heads // num_kv_heads),
+            BLOCK_N=block_n,
+            PAIR_LOADS=pair_loads,
+            num_warps=4,
+            num_stages=2,
+        )
+
+    byte_path = torch.zeros_like(q)
+    pair_path = torch.zeros_like(q)
+    launch(False, byte_path)
+    launch(True, pair_path)
+
+    exact = (pair_path == byte_path).float().mean().item()
+    assert exact > 0.99, f"pair loads diverge from byte path: {exact:.4f} exact"
+    torch.testing.assert_close(pair_path, byte_path, rtol=2e-2, atol=2e-3)
+
+
+@requires_qsa_kernels
 @pytest.mark.parametrize("decode_query_len", [1, 2, 3, 4])
 def test_qsa_split_selection_correctness(workspace_init, decode_query_len: int) -> None:
     query_lens = [decode_query_len, decode_query_len, 33]
