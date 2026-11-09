@@ -35,6 +35,30 @@ __device__ __forceinline__ void cp_async_wait_all() {
   asm volatile("cp.async.wait_all;\n" ::: "memory");
 }
 
+template <int Pending>
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(Pending) : "memory");
+}
+
+// Waits until at most `pending` (0..3) copy groups are in flight; `pending`
+// folds to a constant once the caller's loop is unrolled.
+__device__ __forceinline__ void cp_async_wait_pending(int pending) {
+  switch (pending) {
+    case 0:
+      cp_async_wait_group<0>();
+      break;
+    case 1:
+      cp_async_wait_group<1>();
+      break;
+    case 2:
+      cp_async_wait_group<2>();
+      break;
+    default:
+      cp_async_wait_group<3>();
+      break;
+  }
+}
+
 template <typename StateT, int ChunkV, int DimK, int Stages>
 __device__ __forceinline__ void copy_state_chunk(StateT* shared_state,
                                                  const StateT* state, int chunk,
@@ -61,8 +85,9 @@ __device__ __forceinline__ float4 load_state4<float>(const float* state) {
 template <>
 __device__ __forceinline__ float4
 load_state4<__nv_bfloat16>(const __nv_bfloat16* state) {
-  const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(state);
-  const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(state + 2);
+  const uint2 packed = *reinterpret_cast<const uint2*>(state);
+  const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&packed.x);
+  const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&packed.y);
   return make_float4(__bfloat162float(lo.x), __bfloat162float(lo.y),
                      __bfloat162float(hi.x), __bfloat162float(hi.y));
 }
@@ -76,13 +101,16 @@ __device__ __forceinline__ void store_state4<float>(float* state,
   *reinterpret_cast<float4*>(state) = value;
 }
 
+// One 8-byte store per 4 values, so a warp fills whole 32-byte sectors.
 template <>
 __device__ __forceinline__ void store_state4<__nv_bfloat16>(
     __nv_bfloat16* state, float4 value) {
-  *reinterpret_cast<__nv_bfloat162*>(state) =
-      __floats2bfloat162_rn(value.x, value.y);
-  *reinterpret_cast<__nv_bfloat162*>(state + 2) =
-      __floats2bfloat162_rn(value.z, value.w);
+  const __nv_bfloat162 lo = __floats2bfloat162_rn(value.x, value.y);
+  const __nv_bfloat162 hi = __floats2bfloat162_rn(value.z, value.w);
+  uint2 packed;
+  packed.x = *reinterpret_cast<const uint32_t*>(&lo);
+  packed.y = *reinterpret_cast<const uint32_t*>(&hi);
+  *reinterpret_cast<uint2*>(state) = packed;
 }
 
 constexpr int kDimK = 128;
@@ -92,11 +120,22 @@ constexpr int kWarps = kThreads / 32;
 constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
 constexpr int kRowsPerWarp = kChunkV / kWarps;
+// A state row lives in an 8-lane group: lane j holds k in 4j + 32s + [0, 4)
+// for segments s = 0..3.
+constexpr int kLanesPerRow = 32 / kRowsPerWarp;
+constexpr int kSegmentStride = 4 * kLanesPerRow;
+constexpr int kRowSegments = kDimK / kSegmentStride;
 constexpr int kMaxMtpTokens = 9;
 constexpr int kTokenPasses = (kMaxMtpTokens + kWarps - 1) / kWarps;
 constexpr int kDtBiasFloat32 = 0;
 constexpr int kDtBiasBFloat16 = 1;
 constexpr int kDtBiasFloat16 = 2;
+
+// A bf16 head state (32 KB) is prefetched whole, an fp32 one streams through
+// two 16 KB stages; either way a CTA takes ~46 KB of shared memory, so 4 CTAs
+// fit an sm_90/sm_100 SM (228 KB) at <= 64 registers per thread.
+template <typename StateT>
+constexpr int kStateStages = sizeof(StateT) == 2 ? kNumChunks : 2;
 
 struct GdnDecodeStrides {
   int64_t mixed_row;
@@ -151,12 +190,25 @@ __device__ __forceinline__ Sum2 warp_reduce_sum_pair(float x, float y) {
   return {x, y};
 }
 
+// Sums a row over its 8-lane group in the order of a 32-lane butterfly over 4
+// consecutive k per lane: segment s stands for butterfly lane j + 8s, so the
+// xor-16 and xor-8 levels are the register adds below. Results are bitwise
+// equal to that full-warp reduction, at 3 shuffles instead of 5.
+__device__ __forceinline__ float row_group_reduce_sum(
+    const float (&partial)[kRowSegments]) {
+  float value = (partial[0] + partial[2]) + (partial[1] + partial[3]);
+  value += __shfl_xor_sync(0xffffffffu, value, 4);
+  value += __shfl_xor_sync(0xffffffffu, value, 2);
+  value += __shfl_xor_sync(0xffffffffu, value, 1);
+  return value;
+}
+
 // SplitV > 1 splits the V rows of one (request, value head) over a cluster of
 // SplitV CTAs along blockIdx.z, so small batches fill more SMs. The gated
 // RMSNorm over V then needs the partial sums of the other CTAs (via DSMEM).
 template <typename StateT, int ValueHeadsPerKeyHead, bool SigmoidGate,
           int SplitV>
-__global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
+__global__ __launch_bounds__(kThreads, 4) void gdn_decode_post_conv_mtp_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
     const float* __restrict__ a_log, const void* __restrict__ dt_bias,
@@ -208,7 +260,8 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
   }
 
   const int key_head = value_head / ValueHeadsPerKeyHead;
-  __shared__ StateT shared_state[2][kChunkV][kDimK];
+  constexpr int kStages = kStateStages<StateT>;
+  __shared__ StateT shared_state[kStages][kChunkV][kDimK];
   __shared__ float shared_q[kMaxMtpTokens][kDimK];
   __shared__ float shared_k[kMaxMtpTokens][kDimK];
   __shared__ __nv_bfloat16 shared_v[kMaxMtpTokens][kDimV];
@@ -216,12 +269,20 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
   __shared__ float shared_decay[kMaxMtpTokens];
   __shared__ float shared_beta[kMaxMtpTokens];
   __shared__ float shared_sum_square[kMaxMtpTokens];
+  __shared__ int shared_destination[kMaxMtpTokens];
 
   StateT* source_state =
       state + static_cast<int64_t>(source_slot) * strides.state_slot +
       value_head * kDimV * kDimK;
-  copy_state_chunk<StateT, kChunkV, kDimK, 2>(
-      &shared_state[0][0][0], source_state, first_chunk, tid, kThreads);
+  // A whole-state buffer takes every chunk of this CTA now, one copy group
+  // each; a two-stage one takes the first chunk and the chunk loop streams
+  // the rest.
+  constexpr int kPrefetchChunks = kStages == kNumChunks ? kChunksPerCta : 1;
+#pragma unroll
+  for (int i = 0; i < kPrefetchChunks; ++i) {
+    copy_state_chunk<StateT, kChunkV, kDimK, kStages>(
+        &shared_state[0][0][0], source_state, first_chunk + i, tid, kThreads);
+  }
 
   // One warp per token. kMaxMtpTokens exceeds kWarps, so warps stride.
   // kTokenPasses bounds the trip count, so the compiler unrolls the passes.
@@ -267,96 +328,92 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
                                                            dt_bias_type));
       shared_decay[t] = __expf(g);
       shared_beta[t] = sigmoid_fast(b_value);
+      shared_destination[t] = state_indices[request * state_indices_width + t];
     }
   }
   __syncthreads();
 
-  const int k_base = lane * 4;
-  int rows[kRowsPerWarp];
-#pragma unroll
-  for (int row = 0; row < kRowsPerWarp; ++row) {
-    rows[row] = warp + row * kWarps;
-  }
+  const int row = warp + (lane / kLanesPerRow) * kWarps;
+  const int k_base = (lane % kLanesPerRow) * 4;
 
 #pragma unroll
   for (int cta_chunk = 0; cta_chunk < kChunksPerCta; ++cta_chunk) {
     const int chunk = first_chunk + cta_chunk;
-    cp_async_wait_all();
-    __syncthreads();
-    if (cta_chunk + 1 < kChunksPerCta) {
-      copy_state_chunk<StateT, kChunkV, kDimK, 2>(
-          &shared_state[0][0][0], source_state, chunk + 1, tid, kThreads);
+    if constexpr (kStages == kNumChunks) {
+      // Every chunk of this CTA is in flight in its own buffer, so the
+      // snapshot writes below (possibly to the source slot) touch only chunks
+      // already read.
+      cp_async_wait_pending(kChunksPerCta - 1 - cta_chunk);
+      __syncthreads();
+    } else {
+      cp_async_wait_all();
+      __syncthreads();
+      if (cta_chunk + 1 < kChunksPerCta) {
+        copy_state_chunk<StateT, kChunkV, kDimK, kStages>(
+            &shared_state[0][0][0], source_state, chunk + 1, tid, kThreads);
+      }
     }
 
-    float h[kRowsPerWarp][4];
+    const int value = chunk * kChunkV + row;
+    float h[kRowSegments][4];
 #pragma unroll
-    for (int row = 0; row < kRowsPerWarp; ++row) {
-      const float4 state_value =
-          load_state4(&shared_state[chunk & 1][rows[row]][k_base]);
-      h[row][0] = state_value.x;
-      h[row][1] = state_value.y;
-      h[row][2] = state_value.z;
-      h[row][3] = state_value.w;
+    for (int s = 0; s < kRowSegments; ++s) {
+      const float4 state_value = load_state4(
+          &shared_state[chunk % kStages][row][k_base + s * kSegmentStride]);
+      h[s][0] = state_value.x;
+      h[s][1] = state_value.y;
+      h[s][2] = state_value.z;
+      h[s][3] = state_value.w;
     }
 
     for (int t = 0; t < num_tokens; ++t) {
-      const float4 q4 = *reinterpret_cast<const float4*>(&shared_q[t][k_base]);
-      const float4 k4 = *reinterpret_cast<const float4*>(&shared_k[t][k_base]);
-      const float q_values[4] = {q4.x, q4.y, q4.z, q4.w};
-      const float k_values[4] = {k4.x, k4.y, k4.z, k4.w};
-
-      float dot_hk[kRowsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
+      float k_values[kRowSegments][4];
+      float dot_hk[kRowSegments] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          h[row][i] *= shared_decay[t];
-          dot_hk[row] += h[row][i] * k_values[i];
-        }
-      }
-      const Sum2 dot_hk_01 = warp_reduce_sum_pair(dot_hk[0], dot_hk[1]);
-      const Sum2 dot_hk_23 = warp_reduce_sum_pair(dot_hk[2], dot_hk[3]);
-      const float reduced_hk[kRowsPerWarp] = {dot_hk_01.x, dot_hk_01.y,
-                                              dot_hk_23.x, dot_hk_23.y};
-
-      float dot_hq[kRowsPerWarp] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-      for (int row = 0; row < kRowsPerWarp; ++row) {
-        const int value = chunk * kChunkV + rows[row];
-        const float delta =
-            (__bfloat162float(shared_v[t][value]) - reduced_hk[row]) *
-            shared_beta[t];
+      for (int s = 0; s < kRowSegments; ++s) {
+        const float4 k4 = *reinterpret_cast<const float4*>(
+            &shared_k[t][k_base + s * kSegmentStride]);
+        k_values[s][0] = k4.x;
+        k_values[s][1] = k4.y;
+        k_values[s][2] = k4.z;
+        k_values[s][3] = k4.w;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-          h[row][i] += k_values[i] * delta;
-          dot_hq[row] += h[row][i] * q_values[i];
+          h[s][i] *= shared_decay[t];
+          dot_hk[s] += h[s][i] * k_values[s][i];
         }
       }
-      const Sum2 dot_hq_01 = warp_reduce_sum_pair(dot_hq[0], dot_hq[1]);
-      const Sum2 dot_hq_23 = warp_reduce_sum_pair(dot_hq[2], dot_hq[3]);
-      if (lane == 0) {
-        shared_out[t][chunk * kChunkV + rows[0]] =
-            __float2bfloat16(dot_hq_01.x);
-        shared_out[t][chunk * kChunkV + rows[1]] =
-            __float2bfloat16(dot_hq_01.y);
-        shared_out[t][chunk * kChunkV + rows[2]] =
-            __float2bfloat16(dot_hq_23.x);
-        shared_out[t][chunk * kChunkV + rows[3]] =
-            __float2bfloat16(dot_hq_23.y);
+      const float delta = (__bfloat162float(shared_v[t][value]) -
+                           row_group_reduce_sum(dot_hk)) *
+                          shared_beta[t];
+
+      float dot_hq[kRowSegments] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int s = 0; s < kRowSegments; ++s) {
+        const float4 q4 = *reinterpret_cast<const float4*>(
+            &shared_q[t][k_base + s * kSegmentStride]);
+        const float q_values[4] = {q4.x, q4.y, q4.z, q4.w};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          h[s][i] += k_values[s][i] * delta;
+          dot_hq[s] += h[s][i] * q_values[i];
+        }
+      }
+      const float reduced_hq = row_group_reduce_sum(dot_hq);
+      if (k_base == 0) {
+        shared_out[t][value] = __float2bfloat16(reduced_hq);
       }
 
-      const int destination_slot =
-          state_indices[request * state_indices_width + t];
+      const int destination_slot = shared_destination[t];
       if (destination_slot > 0) {
         StateT* destination_state =
             state +
             static_cast<int64_t>(destination_slot) * strides.state_slot +
-            value_head * kDimV * kDimK;
+            value_head * kDimV * kDimK + value * kDimK + k_base;
 #pragma unroll
-        for (int row = 0; row < kRowsPerWarp; ++row) {
-          const int value = chunk * kChunkV + rows[row];
-          store_state4(destination_state + value * kDimK + k_base,
-                       make_float4(h[row][0], h[row][1], h[row][2], h[row][3]));
+        for (int s = 0; s < kRowSegments; ++s) {
+          store_state4(destination_state + s * kSegmentStride,
+                       make_float4(h[s][0], h[s][1], h[s][2], h[s][3]));
         }
       }
     }
@@ -447,6 +504,13 @@ cudaError_t launch_split(dim3 grid, cudaStream_t stream, Args... args) {
   const auto kernel =
       gdn_decode_post_conv_mtp_kernel<StateT, ValueHeadsPerKeyHead, SigmoidGate,
                                       SplitV>;
+  // 4 CTAs per SM need the largest shared-memory carveout.
+  const cudaError_t carveout_error = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+      cudaSharedmemCarveoutMaxShared);
+  if (carveout_error != cudaSuccess) {
+    return carveout_error;
+  }
   cudaLaunchAttribute attribute{};
   attribute.id = cudaLaunchAttributeClusterDimension;
   attribute.val.clusterDim = {1, 1, SplitV};
@@ -544,7 +608,7 @@ void fused_gdn_decode_post_conv_mtp(
       "cu_seqlens must be a CUDA int32 tensor");
   STD_TORCH_CHECK(num_accepted_tokens.is_cuda() &&
                       num_accepted_tokens.scalar_type() == ScalarType::Int,
-                  "num_accepted_tokens must be a CUDA int32 tensor");
+                  "num_accepted_tokens must have N elements");
   const auto state_scalar_type = state.scalar_type();
   STD_TORCH_CHECK(
       state.is_cuda() && (state_scalar_type == ScalarType::Float ||
