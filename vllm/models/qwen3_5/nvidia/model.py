@@ -120,6 +120,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.offloader import get_offloader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -513,6 +514,11 @@ class Qwen3_5Model(nn.Module, EagleModelMixin):
             self.vocab_size,
             config.hidden_size,
         )
+        offloader = get_offloader()
+        if offloader.supports_tower_offload:
+            (self.embed_tokens,) = offloader.wrap_modules(
+                (m for m in (self.embed_tokens,)), prefix=f"{prefix}.embed_tokens"
+            )
 
         def get_layer(prefix: str):
             return Qwen3_5DecoderLayer(
